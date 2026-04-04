@@ -104,9 +104,13 @@ struct ManoeuvreParams {
  * @brief Paramètres complets pour le calcul acoustique d'un scénario de drone.
  */
 struct AcousticParams {
+    // -- Échelle & référentiel --
+    double unit_scale      = 100.0;  ///< 1 unité mesh = unit_scale mètres (défaut 100)
+    int    reflection_order = 1;     ///< Ordre de réflexion : 0 = direct seul, 1 = +réflexion sol
+
     // -- Source --
-    double source_height   = 10.0;   ///< Hauteur de la source [m]
-    double receiver_height =  1.2;   ///< Hauteur du récepteur [m]
+    double source_height   = -1.0;   ///< Hauteur source [m] (-1 = auto depuis Z × scale)
+    double receiver_height =  0.0;   ///< Hauteur récepteur par défaut [m]
 
     /// Niveaux de puissance acoustique par bande [dB re 1 pW]
     /// (utilisé si aucun DroneEmissionModel n'est fourni)
@@ -180,6 +184,9 @@ class AcousticModel {
 public:
     explicit AcousticModel(const AcousticParams& params);
 
+    /// Accès en lecture aux paramètres (utilisé par Scene pour la géométrie)
+    const AcousticParams& params() const { return params_; }
+
     // ── Calcul principal ──────────────────────────────────────────────────────
 
     /**
@@ -230,6 +237,19 @@ public:
 
     /// Effet de sol par interférences directe + réfléchie [dB]
     double groundEffect(double freq_Hz, double distance_m) const;
+
+    /**
+     * @brief Calcule le SPL pondéré A pour un trajet réfléchi seul [dB(A)].
+     *
+     * Utilisé pour les faces occultées du trajet direct mais qui reçoivent
+     * le son via la réflexion au sol (méthode source-image).
+     * Applique : Lw − divergence(d_refl) − absorption_atm(d_refl) + R_p(f,ψ)
+     *
+     * @param d_horiz  Distance horizontale source–récepteur [m]
+     * @param hs       Hauteur de la source au-dessus du sol [m]
+     * @param hr       Hauteur du récepteur au-dessus du sol [m]
+     */
+    double computeReflectedSPL(double d_horiz, double hs, double hr) const;
 
     // ── Modèles spécifiques aux drones (Section 2.3 & 3) ─────────────────────
 

@@ -133,14 +133,14 @@ AcousticModel::AcousticModel(const AcousticParams& params)
 
 double AcousticModel::getGroundResistivity(GroundType type)
 {
-    // Valeurs en kPa·s/m² converties en Pa·s/m² (×1000)
-    // Sources : Delany & Bazley (1970), papier Section 4.2.3
+    // Valeurs en kPa·s/m² (convention Delany & Bazley 1970)
+    // Le paramètre normalisé f/σ utilise σ en kPa·s/m² directement.
     switch (type) {
-        case GroundType::ASPHALT:      return 20000.0e3; // 20 000 kPa·s/m²
-        case GroundType::COMPACT_SOIL: return  5000.0e3; //  5 000 kPa·s/m²
-        case GroundType::GRASS:        return   300.0e3; //    300 kPa·s/m²
+        case GroundType::ASPHALT:      return 20000.0; // 20 000 kPa·s/m²
+        case GroundType::COMPACT_SOIL: return  5000.0; //  5 000 kPa·s/m²
+        case GroundType::GRASS:        return   300.0; //    300 kPa·s/m²
     }
-    return 300.0e3;
+    return 300.0;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -242,7 +242,7 @@ double AcousticModel::groundEffect(double freq_Hz, double distance_m) const
 
     // Impédance normalisée Delany-Bazley
     double f_over_sigma = freq_Hz / ground_resistivity_;
-    f_over_sigma = std::clamp(f_over_sigma, 1e-10, 1.0);
+    f_over_sigma = std::max(f_over_sigma, 1e-10);
 
     double Z_real = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
     double Z_imag = -11.9 * std::pow(f_over_sigma, -0.73);
@@ -362,6 +362,69 @@ void AcousticModel::computeDroneLw(const DroneEmissionModel& model,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Réflexion au sol seule (source-image)
+// ═════════════════════════════════════════════════════════════════════════════
+
+double AcousticModel::computeReflectedSPL(double d_horiz, double hs, double hr) const
+{
+    // Distance du trajet réfléchi (méthode source-image)
+    double d_reflected = std::sqrt(d_horiz * d_horiz + (hs + hr) * (hs + hr));
+    if (d_reflected <= 0.0)
+        return -std::numeric_limits<double>::infinity();
+
+    // Divergence géométrique sur le trajet réfléchi
+    double A_div = geometricalSpreading(d_reflected);
+
+    // Angle rasant au point de réflexion
+    double sin_psi = std::clamp((hs + hr) / d_reflected, 0.0, 1.0);
+
+    // ── Niveaux de puissance Lw ──────────────────────────────────────────────
+    double Lw[NUM_BANDS];
+
+    if (params_.drone_model != nullptr) {
+        const DroneEmissionModel& model = *params_.drone_model;
+        double rpm_actual = params_.rpm_actual;
+        if (rpm_actual <= 0.0) {
+            ManoeuvreParams mp = getManoeuvreParams(params_.manoeuvre, model);
+            rpm_actual = mp.rpm_average;
+        }
+        computeDroneLw(model, rpm_actual, Lw, params_.d_ref);
+    } else {
+        for (int i = 0; i < NUM_BANDS; ++i)
+            Lw[i] = params_.source_Lw[i];
+    }
+
+    // ── Calcul bande par bande ───────────────────────────────────────────────
+    double sum = 0.0;
+    for (int i = 0; i < NUM_BANDS; ++i) {
+        double f = THIRD_OCTAVE_FREQS[i];
+
+        // Absorption atmosphérique sur le trajet réfléchi
+        double A_atm = atmosphericAbsorption(f, d_reflected);
+
+        // Coefficient de réflexion Delany-Bazley
+        double f_over_sigma = std::max(f / ground_resistivity_, 1e-10);
+        double Z_real = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
+        double Z_imag = -11.9 * std::pow(f_over_sigma, -0.73);
+        std::complex<double> Z_norm(Z_real, Z_imag);
+        std::complex<double> Zsin  = Z_norm * sin_psi;
+        std::complex<double> R_p   = (Zsin - 1.0) / (Zsin + 1.0);
+
+        // Perte par réflexion [dB]
+        double R_loss = 20.0 * std::log10(std::max(std::abs(R_p), 1e-10));
+
+        // Lp = Lw − divergence − absorption_atm + réflexion
+        double Lp = Lw[i] - A_div - A_atm + R_loss;
+
+        // Sommation énergétique pondérée A
+        double L_Aw = Lp + A_WEIGHTING[i];
+        sum += std::pow(10.0, L_Aw / 10.0);
+    }
+
+    return 10.0 * std::log10(std::max(sum, 1e-30));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Calcul SPL principal
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -408,7 +471,9 @@ void AcousticModel::computeSPLSpectrum(double distance_m, bool visible,
         double f     = THIRD_OCTAVE_FREQS[i];
         double A_atm = atmosphericAbsorption(f, distance_m);
         double D     = directivityCorrection(theta, f);
-        double G     = groundEffect(f, distance_m);
+        // Effet de sol (interférences directe+réfléchie) seulement si réflexion activée
+        double G     = (params_.reflection_order >= 1)
+                       ? groundEffect(f, distance_m) : 0.0;
 
         // Lp(i) = Lw(i) − A_div − A_atm + D + G
         out_bands[i] = Lw[i] - A_div - A_atm + D + G;

@@ -62,8 +62,13 @@ public:
     // ── Acoustic computation ─────────────────────────────────────────────────
 
     /// Compute A-weighted SPL [dB(A)] for every face given ray distances.
+    /// Includes ground reflection for occluded faces (image source method).
+    /// @param distances  Per-face distance from direct ray tracing
+    /// @param model      Acoustic propagation model
+    /// @param source     3D position of the sound source
     std::vector<double> computeNoiseMap(const std::vector<float>&  distances,
-                                        const AcousticModel&       model) const;
+                                        const AcousticModel&       model,
+                                        const Point&               source) const;
 
     // ── Property attachment ──────────────────────────────────────────────────
 

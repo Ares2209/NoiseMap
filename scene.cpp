@@ -182,37 +182,68 @@ std::vector<float> Scene::traceRays(const Point& source) const
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
-                                           const AcousticModel&      model) const
+                                           const AcousticModel&      model,
+                                           const Point&              source) const
 {
     const size_t N = distances.size();
     std::vector<double> spl(N, -std::numeric_limits<double>::infinity());
 
-    // Seuil : distance = FLT_MAX → occluded (convention ray_tracer.cpp)
-    const float occluded_threshold = std::numeric_limits<float>::max() * 0.5f;
+    const auto& ap    = model.params();
+    const double scale = ap.unit_scale;   // 1 unité mesh = scale mètres
+
+    // Référentiel : Z = 0 est le sol.
+    // Hauteur source en mètres = source.z() × scale
+    const double hs_m = source.z() * scale;
+
+    // Centroïdes pour le calcul de la réflexion sur les faces occultées
+    const auto& cents = faceCentroids();
 
     double spl_max = -std::numeric_limits<double>::infinity();
     double spl_min =  std::numeric_limits<double>::infinity();
-    size_t vis     = 0;
+    size_t vis_direct    = 0;
+    size_t vis_reflected = 0;
 
     for (size_t i = 0; i < N; ++i) {
-        const float d = distances[i];
+        const float d_raw = distances[i];
 
-        // Visible si distance > 0 et non occluded
-        if (d <= 0.0f || d >= occluded_threshold)
-            continue;
+        // Convention ray_tracer : d > 0 → visible, d = −1 → occultée
+        const bool direct_visible = (d_raw > 0.0f);
 
-        spl[i] = model.computeSPL(static_cast<double>(d),
-                                  /*line_of_sight=*/true);
-        ++vis;
+        if (direct_visible) {
+            // ── Trajet direct ────────────────────────────────────────────
+            // Conversion distance mesh → mètres
+            const double d_m = static_cast<double>(d_raw) * scale;
+
+            // computeSPL inclut l'interférence directe+réfléchie (groundEffect)
+            // si reflection_order >= 1
+            spl[i] = model.computeSPL(d_m, /*visible=*/true);
+            ++vis_direct;
+
+        } else if (ap.reflection_order >= 1 && i < cents.size()) {
+            // ── Trajet réfléchi seul (source-image, Z=0 = sol) ───────────
+            const Point& c = cents[i];
+            double dx = (c.x() - source.x()) * scale;
+            double dy = (c.y() - source.y()) * scale;
+            double d_horiz_m = std::sqrt(dx * dx + dy * dy);
+            double hr_m = c.z() * scale;   // hauteur récepteur au-dessus du sol
+
+            // Réflexion valide seulement si source et récepteur au-dessus du sol
+            if (hr_m >= 0.0 && hs_m > 0.0) {
+                spl[i] = model.computeReflectedSPL(d_horiz_m, hs_m, hr_m);
+                if (std::isfinite(spl[i]))
+                    ++vis_reflected;
+            }
+        }
+
         if (std::isfinite(spl[i])) {
             spl_max = std::max(spl_max, spl[i]);
             spl_min = std::min(spl_min, spl[i]);
         }
     }
 
-    spdlog::info("computeNoiseMap: {}/{} faces visible  "
+    spdlog::info("computeNoiseMap: {}/{} direct, {}/{} reflected-only  "
                  "SPL min={:.1f}  max={:.1f} dB(A)",
-                 vis, N,
+                 vis_direct, N, vis_reflected, N,
                  std::isfinite(spl_min) ? spl_min : 0.0,
                  std::isfinite(spl_max) ? spl_max : 0.0);
 

@@ -52,11 +52,17 @@ void printUsage(const char* progname)
     std::cerr
         << "Usage: " << progname
         << " <ply_file> <x> <y> <z>\n"
+        << "\n"
+        << "  Coordinate system: Z=0 is ground, Z>0 is buildings.\n"
+        << "  Coordinates are in mesh units (1 unit = --scale meters).\n"
+        << "\n"
+        << "  [--scale         <meters>]          (1 mesh unit = N meters, default 100)\n"
+        << "  [--reflections   <0|1>]             (0=direct only, 1=+ground reflection, default 1)\n"
         << "  [--ground        asphalt|soil|grass]\n"
         << "  [--temp          <celsius>]\n"
         << "  [--humidity      <percent>]\n"
         << "  [--pressure      <kPa>]\n"
-        << "  [--source-height <meters>]\n"
+        << "  [--source-height <meters>]          (override, default = Z × scale)\n"
         << "  [--receiver-height <meters>]\n"
         << "\n"
         << "  Drone options (optional – overrides generic Lw if provided):\n"
@@ -73,7 +79,7 @@ void printUsage(const char* progname)
         << "  - Geometrical spreading   (1/r²)\n"
         << "  - Atmospheric absorption  (ISO 9613-1)\n"
         << "  - Vertical directivity    (polynomial + high-shelving filter)\n"
-        << "  - Ground reflection       (Delany-Bazley interference)\n"
+        << "  - Ground reflection       (Delany-Bazley, image source method) [if --reflections 1]\n"
         << "  - RPM equalisation        (Eq. 2, Heutschi et al. 2020) [if --drone]\n"
         << "  - Manoeuvre RPM model     (Tables 4-5)                  [if --drone]\n"
         << "\n"
@@ -163,8 +169,24 @@ bool parseArguments(int argc, char* argv[],
     for (int i = 5; i < argc; ++i) {
         std::string arg = argv[i];
 
+        // ── Échelle & réflexion ───────────────────────────────────────────────
+        if (arg == "--scale" && i + 1 < argc) {
+            ap.unit_scale = std::stod(argv[++i]);
+            if (ap.unit_scale <= 0.0) {
+                spdlog::error("Scale must be > 0 (got {:.3f})", ap.unit_scale);
+                return false;
+            }
+        }
+        else if (arg == "--reflections" && i + 1 < argc) {
+            ap.reflection_order = std::stoi(argv[++i]);
+            if (ap.reflection_order < 0 || ap.reflection_order > 1) {
+                spdlog::error("Reflection order must be 0 or 1 (got {})",
+                              ap.reflection_order);
+                return false;
+            }
+        }
         // ── Options générales ─────────────────────────────────────────────────
-        if (arg == "--ground" && i + 1 < argc) {
+        else if (arg == "--ground" && i + 1 < argc) {
             std::string gt = argv[++i];
             if      (gt == "asphalt") ap.ground_type = GroundType::ASPHALT;
             else if (gt == "soil")    ap.ground_type = GroundType::COMPACT_SOIL;
@@ -231,6 +253,10 @@ bool parseArguments(int argc, char* argv[],
         }
     }
 
+    // ── source_height auto depuis Z × scale si non fourni explicitement ─────
+    if (ap.source_height < 0.0)
+        ap.source_height = emission.z() * ap.unit_scale;
+
     // ── Résolution du modèle de drone ─────────────────────────────────────────
     if (!droneName.empty()) {
         const DroneEmissionModel* dronePtr =
@@ -268,11 +294,18 @@ bool parseArguments(int argc, char* argv[],
 static void logParameters(const Point&          emission,
                            const AcousticParams& ap)
 {
+    spdlog::info("─── Référentiel ───────────────────────────────────────");
+    spdlog::info("  Scale         : 1 unit = {:.1f} m", ap.unit_scale);
+    spdlog::info("  Reflections   : {}", ap.reflection_order);
+
     spdlog::info("─── Source ────────────────────────────────────────────");
-    spdlog::info("  Position      : ({:.3f}, {:.3f}, {:.3f})",
+    spdlog::info("  Position mesh : ({:.4f}, {:.4f}, {:.4f})",
                  emission.x(), emission.y(), emission.z());
-    spdlog::info("  Source height : {:.2f} m", ap.source_height);
-    spdlog::info("  Recv.  height : {:.2f} m", ap.receiver_height);
+    spdlog::info("  Position [m]  : ({:.1f}, {:.1f}, {:.1f})",
+                 emission.x() * ap.unit_scale,
+                 emission.y() * ap.unit_scale,
+                 emission.z() * ap.unit_scale);
+    spdlog::info("  Source height : {:.2f} m  (Z=0 = sol)", ap.source_height);
 
     spdlog::info("─── Atmosphere ────────────────────────────────────────");
     spdlog::info("  Temperature   : {:.1f} °C",  ap.temperature_C);
@@ -345,9 +378,10 @@ int main(int argc, char* argv[])
         std::vector<float> distances = scene.traceRays(emission);
         scene.addDistances(distances);
 
-        // ── 3. Modèle acoustique ──────────────────────────────────────────
+        // ── 3. Modèle acoustique (direct + réflexion au sol) ────────────
         AcousticModel       model(acousticParams);
-        std::vector<double> spl_dBA = scene.computeNoiseMap(distances, model);
+        std::vector<double> spl_dBA = scene.computeNoiseMap(distances, model,
+                                                             emission);
         scene.addSPL(spl_dBA);
 
         // ── 4. Colorisation ───────────────────────────────────────────────
