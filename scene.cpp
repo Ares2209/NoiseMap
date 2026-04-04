@@ -337,6 +337,20 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
         }
     }
 
+    // Onde directe uniquement : les faces occultées ne reçoivent aucun son.
+    // Réinitialise les sommets de toute face occultée en gris foncé pour éviter
+    // que l'interpolation des couleurs par sommet ne colore ces faces.
+    {
+        size_t i = 0;
+        for (auto f : mesh_.faces()) {
+            if (i >= spl.size() || !std::isfinite(spl[i])) {
+                for (auto v : CGAL::vertices_around_face(mesh_.halfedge(f), mesh_))
+                    vcolor[v] = CGAL::IO::Color(30, 30, 30);
+            }
+            ++i;
+        }
+    }
+
     spdlog::debug("addNoiseMapColor: face colour {} / vertex colour {}",
                   fc_created ? "added" : "updated",
                   vc_created ? "added" : "updated");
