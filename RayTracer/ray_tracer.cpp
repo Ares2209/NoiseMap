@@ -396,6 +396,111 @@ std::vector<float> RayTracer::computeRaysAndHits(
 }
 
 
+// ─── computeRaysFromCentroids (fast path – reuses pre-computed centroids) ────
+
+std::vector<float> RayTracer::computeRaysFromCentroids(
+    const Point&                   origin,
+    const std::vector<Point>&      centroids,
+    OptixDeviceContext              optixContext,
+    OptixTraversableHandle          gasHandle,
+    OptixPipeline                   pipelineArg,
+    const OptixShaderBindingTable&  sbtArg) const
+{
+    constexpr float TMAX_OFFSET_REL = 0.01f;
+    constexpr float TMAX_OFFSET_MIN = 1e-3f;
+    constexpr float TMAX_OFFSET_MAX = 0.5f;
+
+    const size_t numRays = centroids.size();
+
+    std::vector<OptixRay> rays(numRays);
+    std::vector<float>    distances(numRays);
+
+    const float3 orig = make_float3(
+        static_cast<float>(origin.x()),
+        static_cast<float>(origin.y()),
+        static_cast<float>(origin.z()));
+
+    // Build ray list from pre-computed centroids (pas de CGAL iteration)
+    for (size_t i = 0; i < numRays; ++i) {
+        const Point& c = centroids[i];
+        float dx  = static_cast<float>(c.x() - origin.x());
+        float dy  = static_cast<float>(c.y() - origin.y());
+        float dz  = static_cast<float>(c.z() - origin.z());
+        float len = sqrtf(dx*dx + dy*dy + dz*dz);
+
+        if (len < 1e-6f) {
+            distances[i] = 0.0f;
+            rays[i] = { orig, make_float3(0.f, 0.f, 1.f), 0.f,
+                         static_cast<unsigned int>(i) };
+            continue;
+        }
+
+        const float3 dir = make_float3(dx / len, dy / len, dz / len);
+        const float offset = std::min(
+            std::max(TMAX_OFFSET_REL * len, TMAX_OFFSET_MIN),
+            TMAX_OFFSET_MAX);
+
+        distances[i] = len;
+        rays[i] = { orig, dir, len - offset, static_cast<unsigned int>(i) };
+    }
+
+    spdlog::debug("Building {} rays (from cached centroids)", numRays);
+
+    // ── GPU upload, launch, download (identique à computeRaysAndHits) ────────
+    OptixRay* d_rays = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rays),
+                          numRays * sizeof(OptixRay)));
+    CUDA_CHECK(cudaMemcpy(d_rays, rays.data(),
+                          numRays * sizeof(OptixRay),
+                          cudaMemcpyHostToDevice));
+
+    uint8_t* d_hits = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_hits),
+                          numRays * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMemset(d_hits, 0, numRays * sizeof(uint8_t)));
+
+    RayGenLaunchParams h_params;
+    h_params.rays      = d_rays;
+    h_params.hits      = d_hits;
+    h_params.numRays   = static_cast<unsigned int>(numRays);
+    h_params.gasHandle = gasHandle;
+
+    RayGenLaunchParams* d_params = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_params),
+                          sizeof(RayGenLaunchParams)));
+    CUDA_CHECK(cudaMemcpy(d_params, &h_params,
+                          sizeof(RayGenLaunchParams),
+                          cudaMemcpyHostToDevice));
+
+    OPTIX_CHECK(optixLaunch(
+        pipelineArg, 0,
+        reinterpret_cast<CUdeviceptr>(d_params),
+        sizeof(RayGenLaunchParams),
+        &sbtArg,
+        static_cast<unsigned int>(numRays), 1u, 1u));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<uint8_t> h_hits(numRays);
+    CUDA_CHECK(cudaMemcpy(h_hits.data(), d_hits,
+                          numRays * sizeof(uint8_t),
+                          cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_rays));
+    CUDA_CHECK(cudaFree(d_hits));
+    CUDA_CHECK(cudaFree(d_params));
+
+    // Résultat : distance si visible, −1 si occultée
+    std::vector<float> result(numRays);
+    for (size_t i = 0; i < numRays; ++i)
+        result[i] = (h_hits[i] != 0u) ? -1.0f : distances[i];
+
+    spdlog::debug("{} visible faces, {} occluded",
+        std::count(h_hits.begin(), h_hits.end(), 0u),
+        std::count(h_hits.begin(), h_hits.end(), 1u));
+
+    return result;
+}
+
 // ─── traceRay (single point) ─────────────────────────────────────────────────
 
 std::vector<float> RayTracer::traceRay(const Point& p) const
@@ -407,6 +512,22 @@ std::vector<float> RayTracer::traceRay(const Point& p) const
 
     auto ms = duration_cast<milliseconds>(high_resolution_clock::now() - start).count();
     spdlog::debug("{} rays computed in {} ms", distances.size(), ms);
+    return distances;
+}
+
+// ─── traceRay (with pre-computed centroids) ──────────────────────────────────
+
+std::vector<float> RayTracer::traceRay(const Point& p,
+                                        const std::vector<Point>& centroids) const
+{
+    auto start = high_resolution_clock::now();
+    spdlog::debug("traceRay called with {} cached centroids", centroids.size());
+
+    auto distances = computeRaysFromCentroids(
+        p, centroids, context, gas_handle, pipeline, sbt);
+
+    auto ms = duration_cast<milliseconds>(high_resolution_clock::now() - start).count();
+    spdlog::info("{} rays computed in {} ms (centroids path)", distances.size(), ms);
     return distances;
 }
 

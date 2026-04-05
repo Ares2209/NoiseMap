@@ -14,12 +14,14 @@
 #include <CGAL/Polygon_mesh_processing/stitch_borders.h>
 #include <CGAL/Polygon_mesh_processing/compute_normal.h>
 
+#include <chrono>
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <atomic>
 
 namespace PMP = CGAL::Polygon_mesh_processing;
 
@@ -98,16 +100,41 @@ void Scene::_loadPLY(const std::string& path)
 
 void Scene::_repairMesh()
 {
+    using clk = std::chrono::high_resolution_clock;
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
+
+    auto t0 = clk::now();
     PMP::remove_isolated_vertices(mesh_);
-    PMP::stitch_borders(mesh_);
+    auto t1 = clk::now();
+    spdlog::info("  remove_isolated_vertices: {} ms", ms(t0, t1));
+
+    // stitch_borders peut être extrêmement lent sur de grands maillages
+    // (O(n²) dans le pire cas). On le skippe au-delà de 100K faces.
+    if (mesh_.number_of_faces() <= 100000) {
+        PMP::stitch_borders(mesh_);
+        auto t2 = clk::now();
+        spdlog::info("  stitch_borders: {} ms", ms(t1, t2));
+        t1 = t2;
+    } else {
+        spdlog::info("  stitch_borders: SKIPPED ({}F > 100K)",
+                     mesh_.number_of_faces());
+    }
+
     PMP::remove_degenerate_faces(mesh_);
+    auto t2 = clk::now();
+    spdlog::info("  remove_degenerate_faces: {} ms", ms(t1, t2));
+
     mesh_.collect_garbage();
+    auto t3 = clk::now();
+    spdlog::info("  collect_garbage: {} ms", ms(t2, t3));
 
     centroidsDirty_ = true;
 
-    spdlog::debug("_repairMesh done: {} V / {} F",
-                  mesh_.number_of_vertices(),
-                  mesh_.number_of_faces());
+    spdlog::info("_repairMesh done: {} V / {} F  total={} ms",
+                 mesh_.number_of_vertices(),
+                 mesh_.number_of_faces(), ms(t0, t3));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,24 +182,20 @@ std::vector<float> Scene::traceRays(const Point& source) const
     spdlog::debug("traceRays: source=({:.3f},{:.3f},{:.3f})",
                   source.x(), source.y(), source.z());
 
-    std::vector<float> distances = rayTracer_->traceRay(source);
+    // Utilise les centroïdes pré-calculés pour éviter de ré-itérer le mesh CGAL
+    const auto& cents = faceCentroids();
+    std::vector<float> distances = rayTracer_->traceRay(source, cents);
 
     if (distances.size() != mesh_.number_of_faces()) {
         spdlog::warn("traceRays: distance count ({}) != face count ({})",
                      distances.size(), mesh_.number_of_faces());
     }
 
-    // ── Debug : compte les faces visibles ────────────────────────────────────
-    const float occluded_threshold = std::numeric_limits<float>::max() * 0.5f;
     size_t visible = std::count_if(distances.begin(), distances.end(),
-        [&](float d){ return d > 0.0f && d < occluded_threshold; });
+        [](float d){ return d > 0.0f; });
 
-    spdlog::debug("traceRays: {}/{} faces visible (threshold={:.2e})",
-                  visible, distances.size(), occluded_threshold);
-
-    // ── Dump des 10 premières distances pour vérification ────────────────────
-    for (size_t i = 0; i < std::min<size_t>(10, distances.size()); ++i)
-        spdlog::trace("  dist[{}] = {:.4f}", i, distances[i]);
+    spdlog::debug("traceRays: {}/{} faces visible",
+                  visible, distances.size());
 
     return distances;
 }
@@ -188,62 +211,75 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
     const size_t N = distances.size();
     std::vector<double> spl(N, -std::numeric_limits<double>::infinity());
 
-    const auto& ap    = model.params();
+    const auto&  ap    = model.params();
     const double scale = ap.unit_scale;   // 1 unité mesh = scale mètres
+    const bool   do_reflect = (ap.reflection_order >= 1);
+    const double reflect_threshold = ap.reflect_filter;
 
     // Référentiel : Z = 0 est le sol.
-    // Hauteur source en mètres = source.z() × scale
     const double hs_m = source.z() * scale;
+    const double src_x = source.x();
+    const double src_y = source.y();
 
     // Centroïdes pour le calcul de la réflexion sur les faces occultées
     const auto& cents = faceCentroids();
+    const size_t n_cents = cents.size();
 
-    double spl_max = -std::numeric_limits<double>::infinity();
-    double spl_min =  std::numeric_limits<double>::infinity();
-    size_t vis_direct    = 0;
-    size_t vis_reflected = 0;
+    std::atomic<size_t> vis_direct{0};
+    std::atomic<size_t> vis_reflected{0};
+    std::atomic<size_t> reflect_skipped{0};
 
+    #pragma omp parallel for schedule(dynamic, 256)
     for (size_t i = 0; i < N; ++i) {
         const float d_raw = distances[i];
 
         // Convention ray_tracer : d > 0 → visible, d = −1 → occultée
-        const bool direct_visible = (d_raw > 0.0f);
-
-        if (direct_visible) {
+        if (d_raw > 0.0f) {
             // ── Trajet direct ────────────────────────────────────────────
-            // Conversion distance mesh → mètres
             const double d_m = static_cast<double>(d_raw) * scale;
-
-            // computeSPL inclut l'interférence directe+réfléchie (groundEffect)
-            // si reflection_order >= 1
             spl[i] = model.computeSPL(d_m, /*visible=*/true);
-            ++vis_direct;
+            vis_direct.fetch_add(1, std::memory_order_relaxed);
 
-        } else if (ap.reflection_order >= 1 && i < cents.size()) {
+        } else if (do_reflect && i < n_cents) {
             // ── Trajet réfléchi seul (source-image, Z=0 = sol) ───────────
             const Point& c = cents[i];
-            double dx = (c.x() - source.x()) * scale;
-            double dy = (c.y() - source.y()) * scale;
-            double d_horiz_m = std::sqrt(dx * dx + dy * dy);
-            double hr_m = c.z() * scale;   // hauteur récepteur au-dessus du sol
+            double dx = (c.x() - src_x) * scale;
+            double dy = (c.y() - src_y) * scale;
+            double hr_m = c.z() * scale;
 
-            // Réflexion valide seulement si source et récepteur au-dessus du sol
             if (hr_m >= 0.0 && hs_m > 0.0) {
+                double d_horiz_m = std::sqrt(dx * dx + dy * dy);
+
+                // ── Filtre reflect_filter : estimation rapide ────────────
+                double d_refl_est = std::sqrt(d_horiz_m * d_horiz_m
+                                              + (hs_m + hr_m) * (hs_m + hr_m));
+                double spl_est = model.estimateSPL_fast(d_refl_est);
+                if (spl_est < reflect_threshold) {
+                    reflect_skipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+
                 spl[i] = model.computeReflectedSPL(d_horiz_m, hs_m, hr_m);
                 if (std::isfinite(spl[i]))
-                    ++vis_reflected;
+                    vis_reflected.fetch_add(1, std::memory_order_relaxed);
             }
         }
+    }
 
+    // ── Statistiques (séquentiel, rapide sur le vecteur résultat) ─────────────
+    double spl_max = -std::numeric_limits<double>::infinity();
+    double spl_min =  std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < N; ++i) {
         if (std::isfinite(spl[i])) {
             spl_max = std::max(spl_max, spl[i]);
             spl_min = std::min(spl_min, spl[i]);
         }
     }
 
-    spdlog::info("computeNoiseMap: {}/{} direct, {}/{} reflected-only  "
-                 "SPL min={:.1f}  max={:.1f} dB(A)",
-                 vis_direct, N, vis_reflected, N,
+    spdlog::info("computeNoiseMap: {}/{} direct, {}/{} reflected  "
+                 "(skipped {} by filter)  SPL [{:.1f}, {:.1f}] dB(A)",
+                 vis_direct.load(), N, vis_reflected.load(), N,
+                 reflect_skipped.load(),
                  std::isfinite(spl_min) ? spl_min : 0.0,
                  std::isfinite(spl_max) ? spl_max : 0.0);
 

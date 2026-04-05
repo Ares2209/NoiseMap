@@ -22,6 +22,7 @@
 #include <string>
 #include <iostream>
 #include <stdexcept>
+#include <chrono>
 
 // ─── Logger ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,7 @@ void printUsage(const char* progname)
         << "\n"
         << "  [--scale         <meters>]          (1 mesh unit = N meters, default 100)\n"
         << "  [--reflections   <0|1>]             (0=direct only, 1=+ground reflection, default 1)\n"
+        << "  [--reflect-filter <dB(A)>]          (skip reflection if estimated SPL < threshold)\n"
         << "  [--ground        asphalt|soil|grass]\n"
         << "  [--temp          <celsius>]\n"
         << "  [--humidity      <percent>]\n"
@@ -185,6 +187,9 @@ bool parseArguments(int argc, char* argv[],
                 return false;
             }
         }
+        else if (arg == "--reflect-filter" && i + 1 < argc) {
+            ap.reflect_filter = std::stod(argv[++i]);
+        }
         // ── Options générales ─────────────────────────────────────────────────
         else if (arg == "--ground" && i + 1 < argc) {
             std::string gt = argv[++i];
@@ -297,6 +302,10 @@ static void logParameters(const Point&          emission,
     spdlog::info("─── Référentiel ───────────────────────────────────────");
     spdlog::info("  Scale         : 1 unit = {:.1f} m", ap.unit_scale);
     spdlog::info("  Reflections   : {}", ap.reflection_order);
+    if (std::isfinite(ap.reflect_filter))
+        spdlog::info("  Reflect filter: {:.1f} dB(A)", ap.reflect_filter);
+    else
+        spdlog::info("  Reflect filter: off (all reflections computed)");
 
     spdlog::info("─── Source ────────────────────────────────────────────");
     spdlog::info("  Position mesh : ({:.4f}, {:.4f}, {:.4f})",
@@ -371,21 +380,28 @@ int main(int argc, char* argv[])
     logParameters(emission, acousticParams);
 
     try {
+        using clk = std::chrono::high_resolution_clock;
+        auto t0 = clk::now();
+
         // ── 1. Chargement de la scène ─────────────────────────────────────
         Scene scene(plyFilePath);
+        auto t1 = clk::now();
 
         // ── 2. Ray tracing ────────────────────────────────────────────────
         std::vector<float> distances = scene.traceRays(emission);
         scene.addDistances(distances);
+        auto t2 = clk::now();
 
         // ── 3. Modèle acoustique (direct + réflexion au sol) ────────────
         AcousticModel       model(acousticParams);
         std::vector<double> spl_dBA = scene.computeNoiseMap(distances, model,
                                                              emission);
         scene.addSPL(spl_dBA);
+        auto t3 = clk::now();
 
         // ── 4. Colorisation ───────────────────────────────────────────────
         scene.addNoiseMapColor(spl_dBA);
+        auto t4 = clk::now();
 
         // ── 5. Export PLY ─────────────────────────────────────────────────
         const std::string outPath =
@@ -393,6 +409,19 @@ int main(int argc, char* argv[])
             + "_noisemap.ply";
 
         scene.writeMeshToPLY(outPath);
+        auto t5 = clk::now();
+
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+        };
+        spdlog::info("─── Timing ────────────────────────────────────────────");
+        spdlog::info("  Load + repair : {} ms", ms(t0, t1));
+        spdlog::info("  Ray tracing   : {} ms", ms(t1, t2));
+        spdlog::info("  Acoustic      : {} ms", ms(t2, t3));
+        spdlog::info("  Colorisation  : {} ms", ms(t3, t4));
+        spdlog::info("  PLY write     : {} ms", ms(t4, t5));
+        spdlog::info("  TOTAL         : {} ms", ms(t0, t5));
+
         spdlog::info("Output written to '{}'", outPath);
 
         // ── 6. Statistiques SPL ───────────────────────────────────────────

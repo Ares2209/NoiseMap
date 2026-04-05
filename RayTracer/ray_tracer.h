@@ -26,6 +26,8 @@ public:
     ~RayTracer() = default;
 
     vector<float>         traceRay(const Point& p) const;
+    vector<float>         traceRay(const Point& p,
+                                   const vector<Point>& centroids) const;
     vector<vector<float>> traceRay(const vector<Point>& points) const;
 
     void cleanup();
@@ -55,6 +57,14 @@ private:
 
     vector<float> computeRaysAndHits(
         const Point&             origin,
+        OptixDeviceContext        optixContext,
+        OptixTraversableHandle   gasHandle,
+        OptixPipeline            pipeline,
+        const OptixShaderBindingTable& sbt) const;
+
+    vector<float> computeRaysFromCentroids(
+        const Point&             origin,
+        const vector<Point>&     centroids,
         OptixDeviceContext        optixContext,
         OptixTraversableHandle   gasHandle,
         OptixPipeline            pipeline,
