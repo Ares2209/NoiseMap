@@ -211,8 +211,9 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
 
         if (direct_visible) {
             // ── Trajet direct ────────────────────────────────────────────
-            // Conversion distance mesh → mètres
-            const double d_m = static_cast<double>(d_raw) * scale;
+            // Conversion distance mesh → mètres, avec un plancher pour
+            // éviter les singularités quand la source est sur une face
+            const double d_m = std::max(static_cast<double>(d_raw) * scale, 1e-3);
 
             // computeSPL inclut l'interférence directe+réfléchie (groundEffect)
             // si reflection_order >= 1
@@ -227,8 +228,8 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
             double d_horiz_m = std::sqrt(dx * dx + dy * dy);
             double hr_m = c.z() * scale;   // hauteur récepteur au-dessus du sol
 
-            // Réflexion valide seulement si source et récepteur au-dessus du sol
-            if (hr_m >= 0.0 && hs_m > 0.0) {
+            // Réflexion valide si source et récepteur au-dessus ou au niveau du sol
+            if (hr_m >= 0.0 && hs_m >= 0.0) {
                 spl[i] = model.computeReflectedSPL(d_horiz_m, hs_m, hr_m);
                 if (std::isfinite(spl[i]))
                     ++vis_reflected;
@@ -385,6 +386,35 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
     spdlog::debug("addNoiseMapColor: face colour {} / vertex colour {}",
                   fc_created ? "added" : "updated",
                   vc_created ? "added" : "updated");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bounding box check
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool Scene::isInsideBBox(const Point& p, double margin,
+                         Point& bbox_min, Point& bbox_max) const
+{
+    double xmin =  std::numeric_limits<double>::infinity();
+    double ymin =  std::numeric_limits<double>::infinity();
+    double zmin =  std::numeric_limits<double>::infinity();
+    double xmax = -std::numeric_limits<double>::infinity();
+    double ymax = -std::numeric_limits<double>::infinity();
+    double zmax = -std::numeric_limits<double>::infinity();
+
+    for (auto v : mesh_.vertices()) {
+        const Point& pt = mesh_.point(v);
+        xmin = std::min(xmin, pt.x()); xmax = std::max(xmax, pt.x());
+        ymin = std::min(ymin, pt.y()); ymax = std::max(ymax, pt.y());
+        zmin = std::min(zmin, pt.z()); zmax = std::max(zmax, pt.z());
+    }
+
+    bbox_min = Point(xmin, ymin, zmin);
+    bbox_max = Point(xmax, ymax, zmax);
+
+    return p.x() >= xmin - margin && p.x() <= xmax + margin
+        && p.y() >= ymin - margin && p.y() <= ymax + margin
+        && p.z() >= zmin - margin && p.z() <= zmax + margin;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -151,7 +151,8 @@ double AcousticModel::getGroundResistivity(GroundType type)
 
 double AcousticModel::geometricalSpreading(double distance_m)
 {
-    if (distance_m <= 0.0) return 0.0;
+    // Plancher à 1 mm pour éviter log(0) et des valeurs infinies
+    distance_m = std::max(distance_m, 1e-3);
     // Source ponctuelle : 20·log₁₀(r) + 10·log₁₀(4π)
     return 20.0 * std::log10(distance_m) + 10.0 * std::log10(4.0 * M_PI);
 }
@@ -368,8 +369,10 @@ void AcousticModel::computeDroneLw(const DroneEmissionModel& model,
 double AcousticModel::computeReflectedSPL(double d_horiz, double hs, double hr) const
 {
     // Distance du trajet réfléchi (méthode source-image)
+    // Quand hs et hr sont nuls (source au sol), le trajet réfléchi dégénère
+    // vers le trajet direct : d_reflected ≈ d_horiz
     double d_reflected = std::sqrt(d_horiz * d_horiz + (hs + hr) * (hs + hr));
-    if (d_reflected <= 0.0)
+    if (d_reflected < 1e-3)
         return -std::numeric_limits<double>::infinity();
 
     // Divergence géométrique sur le trajet réfléchi

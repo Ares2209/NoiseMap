@@ -149,9 +149,18 @@ bool parseArguments(int argc, char* argv[],
 
     plyFilePath = argv[1];
     try {
-        emission = Point(std::stod(argv[2]),
-                         std::stod(argv[3]),
-                         std::stod(argv[4]));
+        double ex = std::stod(argv[2]);
+        double ey = std::stod(argv[3]);
+        double ez = std::stod(argv[4]);
+
+        // Décaler les coordonnées nulles pour éviter les singularités
+        // (log(0), division par 0, source sur le plan du sol, etc.)
+        constexpr double EPS = 1e-4;
+        if (std::abs(ex) < EPS) ex = EPS;
+        if (std::abs(ey) < EPS) ey = EPS;
+        if (std::abs(ez) < EPS) ez = EPS;
+
+        emission = Point(ex, ey, ez);
     } catch (const std::exception&) {
         spdlog::error("Invalid source coordinates: {} {} {}",
                       argv[2], argv[3], argv[4]);
@@ -373,6 +382,39 @@ int main(int argc, char* argv[])
     try {
         // ── 1. Chargement de la scène ─────────────────────────────────────
         Scene scene(plyFilePath);
+
+        // ── 1b. Vérification : source dans la bounding box du maillage ───
+        {
+            Point bbox_min, bbox_max;
+            // Marge de 10% de la diagonale pour tolérer les sources proches
+            double diag = std::sqrt(
+                std::pow(1.0, 2) + std::pow(1.0, 2) + std::pow(1.0, 2));
+            // Calculer la diagonale réelle après avoir obtenu la bbox
+            if (!scene.isInsideBBox(emission, 0.0, bbox_min, bbox_max)) {
+                double dx = bbox_max.x() - bbox_min.x();
+                double dy = bbox_max.y() - bbox_min.y();
+                double dz = bbox_max.z() - bbox_min.z();
+                diag = std::sqrt(dx*dx + dy*dy + dz*dz);
+                double margin = diag * 0.1;
+
+                if (!scene.isInsideBBox(emission, margin, bbox_min, bbox_max)) {
+                    spdlog::error(
+                        "Source ({:.4f}, {:.4f}, {:.4f}) is outside the mesh "
+                        "bounding box [{:.4f}..{:.4f}, {:.4f}..{:.4f}, {:.4f}..{:.4f}] "
+                        "(with {:.2f}% margin).",
+                        emission.x(), emission.y(), emission.z(),
+                        bbox_min.x(), bbox_max.x(),
+                        bbox_min.y(), bbox_max.y(),
+                        bbox_min.z(), bbox_max.z(),
+                        10.0);
+                    return EXIT_FAILURE;
+                }
+                spdlog::warn(
+                    "Source ({:.4f}, {:.4f}, {:.4f}) is outside the mesh "
+                    "bounding box but within 10% margin — proceeding.",
+                    emission.x(), emission.y(), emission.z());
+            }
+        }
 
         // ── 2. Ray tracing ────────────────────────────────────────────────
         std::vector<float> distances = scene.traceRays(emission);

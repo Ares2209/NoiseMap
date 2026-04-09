@@ -95,6 +95,11 @@ public:
     /// Face centroids (computed once, cached).
     const std::vector<Point>& faceCentroids() const;
 
+    /// Returns true if the point lies within the mesh bounding box (with margin).
+    /// Sets bbox_min / bbox_max to the mesh bounds.
+    bool isInsideBBox(const Point& p, double margin,
+                      Point& bbox_min, Point& bbox_max) const;
+
 private:
     // ── Helpers ──────────────────────────────────────────────────────────────
 

@@ -301,7 +301,9 @@ std::vector<float> RayTracer::computeRaysAndHits(
         float len = sqrtf(dx*dx + dy*dy + dz*dz);
 
         if (len < 1e-6f) {
-            distances.push_back(0.0f);
+            // Source coïncide avec le centroïde : utiliser une distance
+            // minimale positive pour éviter le cas dégénéré d=0
+            distances.push_back(1e-6f);
             rays.push_back({ orig, make_float3(0.f, 0.f, 1.f), 0.f, faceIdx });
             ++faceIdx;
             continue;
