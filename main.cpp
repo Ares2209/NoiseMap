@@ -22,6 +22,7 @@
 #include <string>
 #include <iostream>
 #include <stdexcept>
+#include <chrono>
 
 // ─── Logger ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,7 @@ void printUsage(const char* progname)
         << "\n"
         << "  [--scale         <meters>]          (1 mesh unit = N meters, default 100)\n"
         << "  [--reflections   <0|1>]             (0=direct only, 1=+ground reflection, default 1)\n"
+        << "  [--reflect-filter <dB(A)>]          (skip reflection if estimated SPL < threshold)\n"
         << "  [--ground        asphalt|soil|grass]\n"
         << "  [--temp          <celsius>]\n"
         << "  [--humidity      <percent>]\n"
@@ -193,6 +195,9 @@ bool parseArguments(int argc, char* argv[],
                               ap.reflection_order);
                 return false;
             }
+        }
+        else if (arg == "--reflect-filter" && i + 1 < argc) {
+            ap.reflect_filter = std::stod(argv[++i]);
         }
         // ── Options générales ─────────────────────────────────────────────────
         else if (arg == "--ground" && i + 1 < argc) {

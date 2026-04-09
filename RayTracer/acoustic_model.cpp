@@ -129,7 +129,49 @@ const DroneEmissionModel* DroneDatabase::find(const std::string& name) const
 AcousticModel::AcousticModel(const AcousticParams& params)
     : params_(params)
     , ground_resistivity_(getGroundResistivity(params.ground_type))
-{}
+{
+    precomputeLw();
+    precomputeBandConstants();
+}
+
+void AcousticModel::precomputeBandConstants()
+{
+    for (int i = 0; i < NUM_BANDS; ++i) {
+        double f = THIRD_OCTAVE_FREQS[i];
+        cached_alpha_[i] = absorptionCoefficient(f);
+        double f_over_sigma = std::max(f / ground_resistivity_, 1e-10);
+        cached_Z_real_[i] = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
+        cached_Z_imag_[i] = -11.9 * std::pow(f_over_sigma, -0.73);
+    }
+}
+
+void AcousticModel::precomputeLw()
+{
+    if (params_.drone_model != nullptr) {
+        const DroneEmissionModel& model = *params_.drone_model;
+        double rpm_actual = params_.rpm_actual;
+        if (rpm_actual <= 0.0) {
+            ManoeuvreParams mp = getManoeuvreParams(params_.manoeuvre, model);
+            rpm_actual = mp.rpm_average;
+        }
+        computeDroneLw(model, rpm_actual, cached_Lw_, params_.d_ref);
+    } else {
+        for (int i = 0; i < NUM_BANDS; ++i)
+            cached_Lw_[i] = params_.source_Lw[i];
+    }
+
+    cached_Lw_sum_A_ = 0.0;
+    for (int i = 0; i < NUM_BANDS; ++i)
+        cached_Lw_sum_A_ += std::pow(10.0, (cached_Lw_[i] + A_WEIGHTING[i]) / 10.0);
+}
+
+double AcousticModel::estimateSPL_fast(double distance_m) const
+{
+    if (distance_m <= 0.0)
+        return -std::numeric_limits<double>::infinity();
+    double A_div = geometricalSpreading(distance_m);
+    return 10.0 * std::log10(std::max(cached_Lw_sum_A_, 1e-30)) - A_div;
+}
 
 double AcousticModel::getGroundResistivity(GroundType type)
 {
@@ -228,7 +270,7 @@ double AcousticModel::directivityCorrection(double theta_deg, double freq_Hz)
 
 // ─── Effet de sol (Delany-Bazley + interférences) ────────────────────────────
 
-double AcousticModel::groundEffect(double freq_Hz, double distance_m) const
+double AcousticModel::groundEffect(int band_idx, double distance_m) const
 {
     if (distance_m <= 0.0) return 0.0;
 
@@ -241,13 +283,8 @@ double AcousticModel::groundEffect(double freq_Hz, double distance_m) const
     double d_reflect= std::sqrt(d_horiz * d_horiz + (hs + hr) * (hs + hr));
     double delta_d  = d_reflect - d_direct;
 
-    // Impédance normalisée Delany-Bazley
-    double f_over_sigma = freq_Hz / ground_resistivity_;
-    f_over_sigma = std::max(f_over_sigma, 1e-10);
-
-    double Z_real = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
-    double Z_imag = -11.9 * std::pow(f_over_sigma, -0.73);
-    std::complex<double> Z_norm(Z_real, Z_imag);
+    // Impédance Delany-Bazley (pré-calculée par bande)
+    std::complex<double> Z_norm(cached_Z_real_[band_idx], cached_Z_imag_[band_idx]);
 
     // Coefficient de réflexion onde plane
     double sin_psi = std::clamp((hs + hr) / d_reflect, 0.0, 1.0);
@@ -258,7 +295,8 @@ double AcousticModel::groundEffect(double freq_Hz, double distance_m) const
     double amp_ratio = Q_mag * (d_direct / d_reflect);
 
     // Interférences directe + réfléchie
-    double k           = 2.0 * M_PI * freq_Hz / 343.0;
+    double f         = THIRD_OCTAVE_FREQS[band_idx];
+    double k         = 2.0 * M_PI * f / 343.0;
     double phase_refl  = std::arg(R_p);
     double total_phase = k * delta_d + phase_refl;
 
@@ -381,45 +419,19 @@ double AcousticModel::computeReflectedSPL(double d_horiz, double hs, double hr) 
     // Angle rasant au point de réflexion
     double sin_psi = std::clamp((hs + hr) / d_reflected, 0.0, 1.0);
 
-    // ── Niveaux de puissance Lw ──────────────────────────────────────────────
-    double Lw[NUM_BANDS];
-
-    if (params_.drone_model != nullptr) {
-        const DroneEmissionModel& model = *params_.drone_model;
-        double rpm_actual = params_.rpm_actual;
-        if (rpm_actual <= 0.0) {
-            ManoeuvreParams mp = getManoeuvreParams(params_.manoeuvre, model);
-            rpm_actual = mp.rpm_average;
-        }
-        computeDroneLw(model, rpm_actual, Lw, params_.d_ref);
-    } else {
-        for (int i = 0; i < NUM_BANDS; ++i)
-            Lw[i] = params_.source_Lw[i];
-    }
-
-    // ── Calcul bande par bande ───────────────────────────────────────────────
+    // ── Calcul bande par bande (Lw + alpha + Z pré-calculés) ──────────────
     double sum = 0.0;
     for (int i = 0; i < NUM_BANDS; ++i) {
-        double f = THIRD_OCTAVE_FREQS[i];
+        double A_atm = cached_alpha_[i] * d_reflected;
 
-        // Absorption atmosphérique sur le trajet réfléchi
-        double A_atm = atmosphericAbsorption(f, d_reflected);
-
-        // Coefficient de réflexion Delany-Bazley
-        double f_over_sigma = std::max(f / ground_resistivity_, 1e-10);
-        double Z_real = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
-        double Z_imag = -11.9 * std::pow(f_over_sigma, -0.73);
-        std::complex<double> Z_norm(Z_real, Z_imag);
+        // Coefficient de réflexion Delany-Bazley (impédance pré-calculée)
+        std::complex<double> Z_norm(cached_Z_real_[i], cached_Z_imag_[i]);
         std::complex<double> Zsin  = Z_norm * sin_psi;
         std::complex<double> R_p   = (Zsin - 1.0) / (Zsin + 1.0);
-
-        // Perte par réflexion [dB]
         double R_loss = 20.0 * std::log10(std::max(std::abs(R_p), 1e-10));
 
-        // Lp = Lw − divergence − absorption_atm + réflexion
-        double Lp = Lw[i] - A_div - A_atm + R_loss;
+        double Lp = cached_Lw_[i] - A_div - A_atm + R_loss;
 
-        // Sommation énergétique pondérée A
         double L_Aw = Lp + A_WEIGHTING[i];
         sum += std::pow(10.0, L_Aw / 10.0);
     }
@@ -447,39 +459,14 @@ void AcousticModel::computeSPLSpectrum(double distance_m, bool visible,
     const double theta   = elevationAngle(d_horiz, dz);
     const double A_div   = geometricalSpreading(distance_m);
 
-    // ── Niveaux de puissance Lw ───────────────────────────────────────────────
-    double Lw[NUM_BANDS];
-
-    if (params_.drone_model != nullptr) {
-        // Chemin principal : modèle drone complet
-        const DroneEmissionModel& model = *params_.drone_model;
-
-        // RPM effectif : valeur fournie ou RPM moyen de la manœuvre
-        double rpm_actual = params_.rpm_actual;
-        if (rpm_actual <= 0.0) {
-            ManoeuvreParams mp = getManoeuvreParams(params_.manoeuvre, model);
-            rpm_actual = mp.rpm_average;
-        }
-
-        computeDroneLw(model, rpm_actual, Lw, params_.d_ref);
-
-    } else {
-        // Chemin de repli : Lw fournis directement
-        for (int i = 0; i < NUM_BANDS; ++i)
-            Lw[i] = params_.source_Lw[i];
-    }
-
-    // ── Calcul bande par bande ────────────────────────────────────────────────
+    // ── Calcul bande par bande (Lw + alpha pré-calculés) ───────────────────
+    const bool do_ground = (params_.reflection_order >= 1);
     for (int i = 0; i < NUM_BANDS; ++i) {
-        double f     = THIRD_OCTAVE_FREQS[i];
-        double A_atm = atmosphericAbsorption(f, distance_m);
-        double D     = directivityCorrection(theta, f);
-        // Effet de sol (interférences directe+réfléchie) seulement si réflexion activée
-        double G     = (params_.reflection_order >= 1)
-                       ? groundEffect(f, distance_m) : 0.0;
+        double A_atm = cached_alpha_[i] * distance_m;
+        double D     = directivityCorrection(theta, THIRD_OCTAVE_FREQS[i]);
+        double G     = do_ground ? groundEffect(i, distance_m) : 0.0;
 
-        // Lp(i) = Lw(i) − A_div − A_atm + D + G
-        out_bands[i] = Lw[i] - A_div - A_atm + D + G;
+        out_bands[i] = cached_Lw_[i] - A_div - A_atm + D + G;
     }
 }
 

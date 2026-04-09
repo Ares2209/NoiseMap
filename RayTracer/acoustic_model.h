@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -107,6 +108,10 @@ struct AcousticParams {
     // -- Échelle & référentiel --
     double unit_scale      = 100.0;  ///< 1 unité mesh = unit_scale mètres (défaut 100)
     int    reflection_order = 1;     ///< Ordre de réflexion : 0 = direct seul, 1 = +réflexion sol
+    double reflect_filter  = -std::numeric_limits<double>::infinity();
+        ///< Seuil SPL [dB(A)] pour filtrer les réflexions. Les faces occultées
+        ///< dont le SPL estimé (divergence géométrique seule) est inférieur à
+        ///< ce seuil ne reçoivent pas de calcul de réflexion. (défaut = −∞ = tout calculer)
 
     // -- Source --
     double source_height   = -1.0;   ///< Hauteur source [m] (-1 = auto depuis Z × scale)
@@ -187,6 +192,14 @@ public:
     /// Accès en lecture aux paramètres (utilisé par Scene pour la géométrie)
     const AcousticParams& params() const { return params_; }
 
+    /// Niveaux de puissance Lw pré-calculés par bande [dB re 1 pW].
+    const double* precomputedLw() const { return cached_Lw_; }
+
+    /// Estimation rapide du SPL [dB(A)] basée uniquement sur la divergence
+    /// géométrique (pas d'absorption, pas de réflexion). Utilisé pour le
+    /// filtrage des réflexions (--reflect-filter).
+    double estimateSPL_fast(double distance_m) const;
+
     // ── Calcul principal ──────────────────────────────────────────────────────
 
     /**
@@ -236,7 +249,8 @@ public:
     double absorptionCoefficient(double freq_Hz) const;
 
     /// Effet de sol par interférences directe + réfléchie [dB]
-    double groundEffect(double freq_Hz, double distance_m) const;
+    /// @param band_idx  Index de bande (0..NUM_BANDS-1) — utilise les valeurs pré-calculées
+    double groundEffect(int band_idx, double distance_m) const;
 
     /**
      * @brief Calcule le SPL pondéré A pour un trajet réfléchi seul [dB(A)].
@@ -299,7 +313,14 @@ public:
 
 private:
     AcousticParams params_;
-    double         ground_resistivity_;  ///< σ [Pa·s/m²]
+    double         ground_resistivity_;         ///< σ [kPa·s/m²]
+    double         cached_Lw_[NUM_BANDS];       ///< Lw pré-calculé
+    double         cached_Lw_sum_A_;            ///< Σ 10^((Lw+A)/10) pour estimation rapide
+    double         cached_alpha_[NUM_BANDS];    ///< Coeff. absorption atm. [dB/m] par bande
+    double         cached_Z_real_[NUM_BANDS];   ///< Partie réelle impédance Delany-Bazley
+    double         cached_Z_imag_[NUM_BANDS];   ///< Partie imaginaire impédance D-B
 
+    void   precomputeLw();
+    void   precomputeBandConstants();
     static double getGroundResistivity(GroundType type);
 };

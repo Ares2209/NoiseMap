@@ -14,6 +14,7 @@ include_directories("${OptiX_DIR}/include")
 
 find_package(spdlog REQUIRED)
 find_package(CGAL CONFIG REQUIRED)
+find_package(OpenMP REQUIRED)
 
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/RayTracer")
 
@@ -50,4 +51,4 @@ target_include_directories(NoiseMap PRIVATE
     ${SRC_DIR}
     "${OptiX_DIR}/include"
 )
-target_link_libraries(NoiseMap PRIVATE RayTracer)
+target_link_libraries(NoiseMap PRIVATE RayTracer OpenMP::OpenMP_CXX)
