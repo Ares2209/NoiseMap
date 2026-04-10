@@ -228,6 +228,26 @@ double AcousticModel::directivityCorrection(double theta_deg, double freq_Hz)
 
 // ─── Effet de sol (Delany-Bazley + interférences) ────────────────────────────
 
+namespace {
+
+/// Coefficient de réflexion onde plane d'un sol à impédance Delany-Bazley.
+/// @param freq_Hz             Fréquence [Hz]
+/// @param ground_resistivity  Résistivité du sol σ [kPa·s/m²]
+/// @param sin_psi             Sinus de l'angle rasant [0…1]
+std::complex<double> delanyBazleyReflection(double freq_Hz,
+                                            double ground_resistivity,
+                                            double sin_psi)
+{
+    double f_over_sigma = std::max(freq_Hz / ground_resistivity, 1e-10);
+    double Z_real = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
+    double Z_imag = -11.9 * std::pow(f_over_sigma, -0.73);
+    std::complex<double> Z_norm(Z_real, Z_imag);
+    std::complex<double> Zsin = Z_norm * sin_psi;
+    return (Zsin - 1.0) / (Zsin + 1.0);
+}
+
+}  // namespace
+
 double AcousticModel::groundEffect(double freq_Hz, double distance_m) const
 {
     if (distance_m <= 0.0) return 0.0;
@@ -241,18 +261,11 @@ double AcousticModel::groundEffect(double freq_Hz, double distance_m) const
     double d_reflect= std::sqrt(d_horiz * d_horiz + (hs + hr) * (hs + hr));
     double delta_d  = d_reflect - d_direct;
 
-    // Impédance normalisée Delany-Bazley
-    double f_over_sigma = freq_Hz / ground_resistivity_;
-    f_over_sigma = std::max(f_over_sigma, 1e-10);
-
-    double Z_real = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
-    double Z_imag = -11.9 * std::pow(f_over_sigma, -0.73);
-    std::complex<double> Z_norm(Z_real, Z_imag);
-
-    // Coefficient de réflexion onde plane
+    // Coefficient de réflexion onde plane (Delany-Bazley)
     double sin_psi = std::clamp((hs + hr) / d_reflect, 0.0, 1.0);
-    std::complex<double> Zsin = Z_norm * sin_psi;
-    std::complex<double> R_p  = (Zsin - 1.0) / (Zsin + 1.0);
+    std::complex<double> R_p = delanyBazleyReflection(freq_Hz,
+                                                       ground_resistivity_,
+                                                       sin_psi);
 
     double Q_mag     = std::abs(R_p);
     double amp_ratio = Q_mag * (d_direct / d_reflect);
@@ -274,7 +287,7 @@ double AcousticModel::groundEffect(double freq_Hz, double distance_m) const
 // Modèles spécifiques aux drones (Sections 2.3, 3.1, 3.2)
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ─── Égalisation RPM (Eq. 2) ─────────────────────────────────────────────────
+// ─── Égalisation RPM (Eq. 2) A voir si on utilise ─────────────────────────────────────────────────
 
 double AcousticModel::rpmEqualization(double freq_Hz, double rpm_actual,
                                       const DroneEmissionModel& model)
@@ -368,6 +381,13 @@ void AcousticModel::computeDroneLw(const DroneEmissionModel& model,
 
 double AcousticModel::computeReflectedSPL(double d_horiz, double hs, double hr) const
 {
+    // IMPORTANT : cette fonction retourne la contribution du trajet réfléchi
+    // SEUL (|p_refl|²), sans terme d'interférence cohérente avec l'onde directe.
+    // Elle est conçue pour les récepteurs dont le trajet direct est occulté.
+    // Ne PAS additionner énergétiquement avec computeSPL/computeSPLSpectrum sur
+    // le même récepteur : celles-ci incluent déjà la réflexion via groundEffect,
+    // ce qui provoquerait une double comptabilisation.
+
     // Distance du trajet réfléchi (méthode source-image)
     // Quand hs et hr sont nuls (source au sol), le trajet réfléchi dégénère
     // vers le trajet direct : d_reflected ≈ d_horiz
@@ -405,13 +425,10 @@ double AcousticModel::computeReflectedSPL(double d_horiz, double hs, double hr) 
         // Absorption atmosphérique sur le trajet réfléchi
         double A_atm = atmosphericAbsorption(f, d_reflected);
 
-        // Coefficient de réflexion Delany-Bazley
-        double f_over_sigma = std::max(f / ground_resistivity_, 1e-10);
-        double Z_real = 1.0 + 9.08  * std::pow(f_over_sigma, -0.75);
-        double Z_imag = -11.9 * std::pow(f_over_sigma, -0.73);
-        std::complex<double> Z_norm(Z_real, Z_imag);
-        std::complex<double> Zsin  = Z_norm * sin_psi;
-        std::complex<double> R_p   = (Zsin - 1.0) / (Zsin + 1.0);
+        // Coefficient de réflexion Delany-Bazley (helper partagé avec groundEffect)
+        std::complex<double> R_p = delanyBazleyReflection(f,
+                                                          ground_resistivity_,
+                                                          sin_psi);
 
         // Perte par réflexion [dB]
         double R_loss = 20.0 * std::log10(std::max(std::abs(R_p), 1e-10));

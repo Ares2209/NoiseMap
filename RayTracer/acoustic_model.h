@@ -245,6 +245,12 @@ public:
      * le son via la réflexion au sol (méthode source-image).
      * Applique : Lw − divergence(d_refl) − absorption_atm(d_refl) + R_p(f,ψ)
      *
+     * @warning Ne PAS additionner énergétiquement avec computeSPL ou
+     * computeSPLSpectrum sur le même récepteur : ces dernières incluent déjà
+     * la contribution réfléchie via groundEffect (interférence cohérente
+     * direct+réfléchi). Cette fonction est à utiliser exclusivement pour les
+     * récepteurs dont le trajet direct est occulté.
+     *
      * @param d_horiz  Distance horizontale source–récepteur [m]
      * @param hs       Hauteur de la source au-dessus du sol [m]
      * @param hr       Hauteur du récepteur au-dessus du sol [m]
