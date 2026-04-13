@@ -191,5 +191,10 @@ Le programme génère un fichier `<input>_noisemap.ply` avec :
 - GPU NVIDIA requis (OptiX)
 
 
+J'aimerais que ce code prenne en compte la reflexion de cette manière : 
 
-Modification appliquée : Les surfaces occultées ne reçoivent aucun son (SPL = −∞) et restent en gris foncé. Le calcul acoustique (`computeNoiseMap`) ignore les faces occultées (distance < 0). La colorisation (`addNoiseMapColor`) fixe la couleur de face des faces occultées en gris foncé et réinitialise également en gris foncé les sommets appartenant à une face occultée, évitant tout saignement de couleur par interpolation lors du rendu.
+Le modèle considère deux rayons distincts pour chaque événement de vol : un rayon direct et un rayon réfléchi par le sol. Ces deux rayons sont traités en parallèle via des processus séparés, puis combinés en sortie.
+
+Pour chaque rayon, une trajectoire tridimensionnelle est calculée à la fréquence d'échantillonnage audio, donnant la position de la source à chaque instant. Pour le rayon direct, la hauteur du récepteur est simplement soustraite à la composante verticale. Pour le rayon réfléchi, la trajectoire est miroir par rapport au sol, simulant une source image située sous le plan du sol.
+
+Cela est simplement pour le traitement de chaque rayon, on laisse par la suite les différents filtrage déjà implémentés

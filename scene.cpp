@@ -209,19 +209,11 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
         // Convention ray_tracer : d > 0 → visible, d = −1 → occultée
         const bool direct_visible = (d_raw > 0.0f);
 
-        if (direct_visible) {
-            // ── Trajet direct ────────────────────────────────────────────
-            // Conversion distance mesh → mètres, avec un plancher pour
-            // éviter les singularités quand la source est sur une face
-            const double d_m = std::max(static_cast<double>(d_raw) * scale, 1e-3);
+        // ── Rayon réfléchi (source-image, Z=0 = sol) ────────────────────
+        // Calculé pour TOUTES les faces si la réflexion est activée
+        double spl_reflected = -std::numeric_limits<double>::infinity();
 
-            // computeSPL inclut l'interférence directe+réfléchie (groundEffect)
-            // si reflection_order >= 1
-            spl[i] = model.computeSPL(d_m, /*visible=*/true);
-            ++vis_direct;
-
-        } else if (ap.reflection_order >= 1 && i < cents.size()) {
-            // ── Trajet réfléchi seul (source-image, Z=0 = sol) ───────────
+        if (ap.reflection_order >= 1 && i < cents.size()) {
             const Point& c = cents[i];
             double dx = (c.x() - source.x()) * scale;
             double dy = (c.y() - source.y()) * scale;
@@ -230,10 +222,34 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
 
             // Réflexion valide si source et récepteur au-dessus ou au niveau du sol
             if (hr_m >= 0.0 && hs_m >= 0.0) {
-                spl[i] = model.computeReflectedSPL(d_horiz_m, hs_m, hr_m);
-                if (std::isfinite(spl[i]))
-                    ++vis_reflected;
+                spl_reflected = model.computeReflectedSPL(d_horiz_m, hs_m, hr_m);
             }
+        }
+
+        if (direct_visible) {
+            // ── Rayon direct (sans effet de sol, traité séparément) ──────
+            const double d_m = std::max(static_cast<double>(d_raw) * scale, 1e-3);
+
+            // direct_only=true : pas de groundEffect, le réfléchi est traité
+            // séparément ci-dessus
+            double spl_direct = model.computeSPL(d_m, /*visible=*/true,
+                                                  /*direct_only=*/true);
+
+            // ── Combinaison par sommation énergétique ────────────────────
+            if (std::isfinite(spl_reflected)) {
+                // 10·log₁₀(10^(Ld/10) + 10^(Lr/10))
+                double e_direct    = std::pow(10.0, spl_direct / 10.0);
+                double e_reflected = std::pow(10.0, spl_reflected / 10.0);
+                spl[i] = 10.0 * std::log10(e_direct + e_reflected);
+            } else {
+                spl[i] = spl_direct;
+            }
+            ++vis_direct;
+
+        } else if (std::isfinite(spl_reflected)) {
+            // ── Face occultée : seul le rayon réfléchi contribue ─────────
+            spl[i] = spl_reflected;
+            ++vis_reflected;
         }
 
         if (std::isfinite(spl[i])) {

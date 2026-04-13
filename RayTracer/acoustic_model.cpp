@@ -449,7 +449,8 @@ double AcousticModel::computeReflectedSPL(double d_horiz, double hs, double hr) 
 // ═════════════════════════════════════════════════════════════════════════════
 
 void AcousticModel::computeSPLSpectrum(double distance_m, bool visible,
-                                        double out_bands[NUM_BANDS]) const
+                                        double out_bands[NUM_BANDS],
+                                        bool direct_only) const
 {
     if (!visible || distance_m <= 0.0) {
         for (int i = 0; i < NUM_BANDS; ++i)
@@ -492,7 +493,8 @@ void AcousticModel::computeSPLSpectrum(double distance_m, bool visible,
         double A_atm = atmosphericAbsorption(f, distance_m);
         double D     = directivityCorrection(theta, f);
         // Effet de sol (interférences directe+réfléchie) seulement si réflexion activée
-        double G     = (params_.reflection_order >= 1)
+        // et si on n'est pas en mode direct_only (rayon réfléchi traité séparément)
+        double G     = (!direct_only && params_.reflection_order >= 1)
                        ? groundEffect(f, distance_m) : 0.0;
 
         // Lp(i) = Lw(i) − A_div − A_atm + D + G
@@ -500,13 +502,14 @@ void AcousticModel::computeSPLSpectrum(double distance_m, bool visible,
     }
 }
 
-double AcousticModel::computeSPL(double distance_m, bool visible) const
+double AcousticModel::computeSPL(double distance_m, bool visible,
+                                  bool direct_only) const
 {
     if (!visible || distance_m <= 0.0)
         return -std::numeric_limits<double>::infinity();
 
     double bands[NUM_BANDS];
-    computeSPLSpectrum(distance_m, visible, bands);
+    computeSPLSpectrum(distance_m, visible, bands, direct_only);
 
     // Sommation énergétique des bandes pondérées A
     double sum = 0.0;

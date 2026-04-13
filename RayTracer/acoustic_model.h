@@ -191,19 +191,24 @@ public:
 
     /**
      * @brief Calcule le SPL pondéré A global [dB(A)].
-     * @param distance_m  Distance source–récepteur [m]
-     * @param visible     Ligne de vue directe disponible
+     * @param distance_m   Distance source–récepteur [m]
+     * @param visible      Ligne de vue directe disponible
+     * @param direct_only  Si true, ne pas inclure l'effet de sol (groundEffect)
+     *                     — utilisé quand le rayon réfléchi est traité séparément
      */
-    double computeSPL(double distance_m, bool visible) const;
+    double computeSPL(double distance_m, bool visible,
+                      bool direct_only = false) const;
 
     /**
      * @brief Calcule le spectre SPL par bande de tiers d'octave [dB].
-     * @param distance_m  Distance source–récepteur [m]
-     * @param visible     Ligne de vue directe disponible
-     * @param out_bands   Tableau de sortie (NUM_BANDS valeurs)
+     * @param distance_m   Distance source–récepteur [m]
+     * @param visible      Ligne de vue directe disponible
+     * @param out_bands    Tableau de sortie (NUM_BANDS valeurs)
+     * @param direct_only  Si true, ne pas inclure l'effet de sol (groundEffect)
      */
     void computeSPLSpectrum(double distance_m, bool visible,
-                            double out_bands[NUM_BANDS]) const;
+                            double out_bands[NUM_BANDS],
+                            bool direct_only = false) const;
 
     // ── Sous-modèles exposés publiquement ────────────────────────────────────
 
