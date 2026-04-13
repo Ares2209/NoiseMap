@@ -188,14 +188,10 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
     const size_t N = distances.size();
     std::vector<double> spl(N, -std::numeric_limits<double>::infinity());
 
-    const auto& ap    = model.params();
-    const double scale = ap.unit_scale;   // 1 unité mesh = scale mètres
+    const auto& ap     = model.params();
+    const double scale = ap.unit_scale;
 
-    // Référentiel : Z = 0 est le sol.
-    // Hauteur source en mètres = source.z() × scale
     const double hs_m = source.z() * scale;
-
-    // Centroïdes pour le calcul de la réflexion sur les faces occultées
     const auto& cents = faceCentroids();
 
     double spl_max = -std::numeric_limits<double>::infinity();
@@ -204,50 +200,58 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
     size_t vis_reflected = 0;
 
     for (size_t i = 0; i < N; ++i) {
-        const float d_raw = distances[i];
-
-        // Convention ray_tracer : d > 0 → visible, d = −1 → occultée
+        const float d_raw        = distances[i];
         const bool direct_visible = (d_raw > 0.0f);
 
-        // ── Rayon réfléchi (source-image, Z=0 = sol) ────────────────────
-        // Calculé pour TOUTES les faces si la réflexion est activée
+        if (i >= cents.size()) continue;
+        const Point& c = cents[i];
+
+        // ── Géométrie réelle face i ─────────────────────────────────────
+        double dx       = (c.x() - source.x()) * scale;
+        double dy       = (c.y() - source.y()) * scale;
+        double hr_m     = c.z() * scale;            // hauteur récepteur [m]
+        double dz_m     = hs_m - hr_m;              // diff. verticale [m]
+        double d_horiz_m = std::sqrt(dx*dx + dy*dy);
+
+        // ── Construit un modèle acoustique avec les hauteurs correctes ──
+        // On clone les params et on met à jour source_height / receiver_height
+        AcousticParams ap_face = ap;
+        ap_face.source_height   = hs_m;
+        ap_face.receiver_height = hr_m;
+        AcousticModel model_face(ap_face);
+
+        // ── Rayon réfléchi ───────────────────────────────────────────────
         double spl_reflected = -std::numeric_limits<double>::infinity();
 
-        if (ap.reflection_order >= 1 && i < cents.size()) {
-            const Point& c = cents[i];
-            double dx = (c.x() - source.x()) * scale;
-            double dy = (c.y() - source.y()) * scale;
-            double d_horiz_m = std::sqrt(dx * dx + dy * dy);
-            double hr_m = c.z() * scale;   // hauteur récepteur au-dessus du sol
-
-            // Réflexion valide si source et récepteur au-dessus ou au niveau du sol
-            if (hr_m >= 0.0 && hs_m >= 0.0) {
-                spl_reflected = model.computeReflectedSPL(d_horiz_m, hs_m, hr_m);
-            }
+        if (ap.reflection_order >= 1 && hr_m >= 0.0 && hs_m >= 0.0) {
+            spl_reflected = model_face.computeReflectedSPL(
+                                d_horiz_m, hs_m, hr_m);
         }
 
         if (direct_visible) {
-            // ── Rayon direct (sans effet de sol, traité séparément) ──────
-            const double d_m = std::max(static_cast<double>(d_raw) * scale, 1e-3);
+            // Distance 3D réelle source → centroïde (ou du ray tracer)
+            // Utilise d_raw du ray tracer car c'est la vraie distance
+            // de propagation (le rayon peut longer un obstacle)
+            const double d_direct_m = std::max(
+                static_cast<double>(d_raw) * scale, 1e-3);
 
-            // direct_only=true : pas de groundEffect, le réfléchi est traité
-            // séparément ci-dessus
-            double spl_direct = model.computeSPL(d_m, /*visible=*/true,
-                                                  /*direct_only=*/true);
+            // direct_only=true : groundEffect désactivé,
+            // réflexion traitée séparément ci-dessus
+            double spl_direct = model_face.computeSPL(
+                                    d_direct_m, /*visible=*/true,
+                                    /*direct_only=*/true);
 
-            // ── Combinaison par sommation énergétique ────────────────────
+            // Combinaison énergétique
             if (std::isfinite(spl_reflected)) {
-                // 10·log₁₀(10^(Ld/10) + 10^(Lr/10))
-                double e_direct    = std::pow(10.0, spl_direct / 10.0);
-                double e_reflected = std::pow(10.0, spl_reflected / 10.0);
-                spl[i] = 10.0 * std::log10(e_direct + e_reflected);
+                double e_d = std::pow(10.0, spl_direct    / 10.0);
+                double e_r = std::pow(10.0, spl_reflected / 10.0);
+                spl[i] = 10.0 * std::log10(e_d + e_r);
             } else {
                 spl[i] = spl_direct;
             }
             ++vis_direct;
 
         } else if (std::isfinite(spl_reflected)) {
-            // ── Face occultée : seul le rayon réfléchi contribue ─────────
             spl[i] = spl_reflected;
             ++vis_reflected;
         }
