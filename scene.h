@@ -34,8 +34,8 @@ struct RGB {
     uint8_t r, g, b;
 };
 
-/// Jet colormap: blue (min) → cyan → green → yellow → red (max)
-RGB splToJetColor(double spl, double spl_min, double spl_max);
+/// Colormap par seuils absolus de bruit [dB(A)]
+RGB splToColor(double spl);
 
 // ─── Scene ────────────────────────────────────────────────────────────────────
 

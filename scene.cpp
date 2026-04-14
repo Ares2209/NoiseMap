@@ -24,23 +24,41 @@
 namespace PMP = CGAL::Polygon_mesh_processing;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Jet colormap
+// Colormap par seuils absolus de bruit [dB(A)]
+//
+//   < 35 dB  → Violet       (inaudible / bruit de fond)
+//  35-45 dB  → Bleu         (très faible)
+//  45-55 dB  → Jaune        (acceptable)
+//  55-75 dB  → Orange       (gênant / attention)
+//  75-85 dB  → Rouge        (nuisance)
+//   > 85 dB  → Rouge foncé  (dangereux)
 // ─────────────────────────────────────────────────────────────────────────────
 
-RGB splToJetColor(double spl, double spl_min, double spl_max)
+static RGB lerpRGB(RGB a, RGB b, double t)
 {
-    double t = 0.0;
-    if (spl_max > spl_min)
-        t = std::clamp((spl - spl_min) / (spl_max - spl_min), 0.0, 1.0);
+    t = std::clamp(t, 0.0, 1.0);
+    return { static_cast<uint8_t>(a.r + (b.r - a.r) * t),
+             static_cast<uint8_t>(a.g + (b.g - a.g) * t),
+             static_cast<uint8_t>(a.b + (b.b - a.b) * t) };
+}
 
-    // Standard 4-segment jet ramps
-    double r = std::clamp(1.5 - std::abs(4.0 * t - 3.0), 0.0, 1.0);
-    double g = std::clamp(1.5 - std::abs(4.0 * t - 2.0), 0.0, 1.0);
-    double b = std::clamp(1.5 - std::abs(4.0 * t - 1.0), 0.0, 1.0);
+RGB splToColor(double spl)
+{
+    // Couleurs de référence pour chaque seuil
+    static constexpr RGB COL_VIOLET    = { 128,   0, 200 };  // < 35 dB
+    static constexpr RGB COL_BLUE      = {   0,  80, 255 };  // 35 dB
+    static constexpr RGB COL_YELLOW    = { 255, 230,   0 };  // 45 dB
+    static constexpr RGB COL_ORANGE    = { 255, 140,   0 };  // 55 dB
+    static constexpr RGB COL_RED       = { 255,   0,   0 };  // 75 dB
+    static constexpr RGB COL_DARK_RED  = { 100,   0,   0 };  // 85 dB
 
-    return { static_cast<uint8_t>(r * 255.0),
-             static_cast<uint8_t>(g * 255.0),
-             static_cast<uint8_t>(b * 255.0) };
+    if (spl < 0.0)  return COL_VIOLET;   // Violet
+    if (spl < 15.0)  return COL_BLUE;     // Bleu
+    if (spl < 25.0)  return COL_YELLOW;   // Jaune
+    if (spl < 35.0)  return COL_ORANGE;   // Orange
+    if (spl < 45.0)  return COL_RED;      // Rouge
+                     return COL_DARK_RED;  // Rouge foncé
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -317,7 +335,7 @@ void Scene::addSPL(const std::vector<double>& spl)
 
 void Scene::addNoiseMapColor(const std::vector<double>& spl)
 {
-    // ── Plage dynamique (faces visibles seulement) ────────────────────────────
+    // ── Statistiques SPL (pour les logs) ─────────────────────────────────────
     double spl_min =  std::numeric_limits<double>::infinity();
     double spl_max = -std::numeric_limits<double>::infinity();
 
@@ -337,7 +355,7 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
     spdlog::debug("addNoiseMapColor: SPL range [{:.1f}, {:.1f}] dB(A)",
                   spl_min, spl_max);
 
-    // ── Couleur par face ──────────────────────────────────────────────────────
+    // ── Couleur par face (seuils absolus) ────────────────────────────────────
     auto [fcolor, fc_created] =
         mesh_.add_property_map<SurfaceMesh::Face_index,
                                CGAL::IO::Color>(
@@ -347,7 +365,7 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
         size_t i = 0;
         for (auto f : mesh_.faces()) {
             if (i < spl.size() && std::isfinite(spl[i])) {
-                RGB c = splToJetColor(spl[i], spl_min, spl_max);
+                RGB c = splToColor(spl[i]);
                 fcolor[f] = CGAL::IO::Color(c.r, c.g, c.b);
             }
             ++i;
@@ -384,7 +402,7 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
         if (vCount[v.idx()] > 0) {
             double avgSPL = 10.0 * std::log10(
                 vEnergy[v.idx()] / static_cast<double>(vCount[v.idx()]));
-            RGB c = splToJetColor(avgSPL, spl_min, spl_max);
+            RGB c = splToColor(avgSPL);
             vcolor[v] = CGAL::IO::Color(c.r, c.g, c.b);
         }
     }

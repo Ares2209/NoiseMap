@@ -183,6 +183,51 @@ Le programme génère un fichier `<input>_noisemap.ply` avec :
 - **Directivité verticale** : Ajustée pour sources aériennes (drones)
 - **Réflexion au sol** : Modèle Delany-Bazley avec interférence
 
+## Outil de détermination d'échelle (ScaleFinder)
+
+Un outil séparé `ScaleFinder` est fourni pour aider à déterminer l'échelle appropriée du maillage 3D par rapport aux dimensions réelles des bâtiments et du terrain.
+
+### Utilisation
+
+```bash
+./ScaleFinder <fichier.ply>
+```
+
+### Fonctionnement
+
+L'outil analyse le maillage PLY et calcule sa bounding box. En supposant que :
+- Les bâtiments sont des immeubles avec une hauteur typique de 20 mètres
+- Le sol est plat (le min Z correspond au niveau du sol)
+
+Il propose un facteur d'échelle pour que la hauteur du maillage corresponde à 20 mètres.
+
+### Exemple de sortie
+
+```
+Loaded mesh: 18292 vertices, 36275 faces
+Bounding box:
+  Min: (-20, -20, 0)
+  Max: (20, 20, 6.91489)
+  Dimensions: 40 x 40 x 6.91489
+
+Suggested scale for buildings:
+  Typical building height: 20 meters
+  Current mesh height: 6.91489 units
+  Scale factor: 2.89231
+  This means 1 unit in mesh = 0.345744 meters
+  Scaled dimensions: 115.692 x 115.692 x 20 meters
+```
+
+### Compilation
+
+L'outil est compilé automatiquement avec le projet principal :
+
+```bash
+mkdir build && cd build
+cmake ..
+make ScaleFinder
+```
+
 ## Limitations
 
 - Source ponctuelle uniquement
