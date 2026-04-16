@@ -9,22 +9,15 @@
 
 #include <optix.h>
 #include <cuda_runtime.h>
-#include <cstdint>                  // uint8_t
-
-#pragma once
-#include <optix.h>
-#include <cuda_runtime.h>
-
-struct OptixRay {
-    float3       origin;
-    float3       direction;
-    float        tmax;
-    unsigned int targetFaceIdx;   // index de la face cible dans le GAS
-};
+#include <cstdint>
 
 struct RayGenLaunchParams {
-    OptixRay*              rays;
-    uint8_t*               hits;       // 1 = occultée, 0 = visible
+    float3                 origin;        // source commune à tous les rayons
+    float3*                centroids;     // centroïdes des faces (GPU, précalculés)
+    uint8_t*               hits;          // sortie : 1 = occultée, 0 = visible
     unsigned int           numRays;
     OptixTraversableHandle gasHandle;
+    float                  tmaxOffsetRel; // fraction de la distance (défaut 0.01)
+    float                  tmaxOffsetMin; // offset minimum (défaut 1e-3)
+    float                  tmaxOffsetMax; // offset maximum (défaut 0.5)
 };

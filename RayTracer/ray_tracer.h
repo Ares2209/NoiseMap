@@ -14,7 +14,7 @@
 #include <CGAL/Simple_cartesian.h>
 #include <CGAL/Surface_mesh.h>
 
-using namespace std;
+#include "optix_ray.h"
 
 typedef CGAL::Simple_cartesian<double>  Kernel;
 typedef Kernel::Point_3                 Point;
@@ -25,38 +25,42 @@ public:
     explicit RayTracer(SurfaceMesh& mesh);
     ~RayTracer() = default;
 
-    vector<float>         traceRay(const Point& p) const;
-    vector<vector<float>> traceRay(const vector<Point>& points) const;
+    std::vector<float>              traceRay(const Point& p) const;
+    std::vector<std::vector<float>> traceRay(const std::vector<Point>& points) const;
 
     void cleanup();
 
 private:
     SurfaceMesh& mesh;
+    unsigned int num_faces = 0;
+
+    // Centroïdes précalculés (une seule fois au constructeur)
+    std::vector<float3> h_centroids;    // côté CPU, pour calcul des distances
+    CUdeviceptr         d_centroids = 0; // côté GPU, pour le kernel
+
+    // Buffers GPU persistants (alloués une fois, réutilisés à chaque lancement)
+    uint8_t*            d_hits_buf   = nullptr;
+    RayGenLaunchParams* d_params_buf = nullptr;
 
     // OptiX handles
-    mutable OptixDeviceContext   context          = nullptr;
-    mutable OptixTraversableHandle gas_handle      = 0;
-    mutable OptixModule          module           = nullptr;
-    mutable OptixProgramGroup    raygen_prog_group = nullptr;
-    mutable OptixProgramGroup    miss_prog_group   = nullptr;
-    mutable OptixProgramGroup    hitgroup_prog_group = nullptr;
-    mutable OptixPipeline        pipeline         = nullptr;
-    mutable OptixShaderBindingTable sbt           = {};
+    OptixDeviceContext       context             = nullptr;
+    OptixTraversableHandle   gas_handle          = 0;
+    OptixModule              module              = nullptr;
+    OptixProgramGroup        raygen_prog_group   = nullptr;
+    OptixProgramGroup        miss_prog_group     = nullptr;
+    OptixProgramGroup        hitgroup_prog_group = nullptr;
+    OptixPipeline            pipeline            = nullptr;
+    OptixShaderBindingTable  sbt                 = {};
 
     // SBT device pointers
     CUdeviceptr raygen_record   = 0;
     CUdeviceptr miss_record     = 0;
     CUdeviceptr hitgroup_record = 0;
 
-    // GAS device buffers (kept alive for the lifetime of the object)
+    // GAS device buffers
     CUdeviceptr d_gas_output_buffer = 0;
     CUdeviceptr d_vertices          = 0;
     CUdeviceptr d_indices           = 0;
 
-    vector<float> computeRaysAndHits(
-        const Point&             origin,
-        OptixDeviceContext        optixContext,
-        OptixTraversableHandle   gasHandle,
-        OptixPipeline            pipeline,
-        const OptixShaderBindingTable& sbt) const;
+    std::vector<float> computeRaysAndHits(const Point& origin) const;
 };
