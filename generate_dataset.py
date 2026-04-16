@@ -1,252 +1,332 @@
 #!/usr/bin/env python3
 """
-Generate ~1000 noise map PLY files from ville.ply with random source positions.
+Génère un dataset en exécutant ./NoiseMap sur un ensemble de points (x,y,z)
+échantillonnés dans ../Data/ville.ply, au-dessus des bâtiments, répartis entre
+4 drones (M2, I2, F-4, S-9).
 
-For each source position, runs NoiseMap with each drone model (M2, I2, F-4, S-9).
-Output files: Ville_colored_x_y_z_100_DRONE.ply
-
-The script:
-1. Parses ville.ply to build a 2D heightmap of buildings
-2. Generates random source positions above buildings
-3. Runs the NoiseMap program for each (position, drone) combination
+Exécution depuis n'importe quel CWD : le script calcule les chemins par rapport
+à son emplacement.
 """
 
+from __future__ import annotations
+
+import csv
+import os
+import shutil
 import subprocess
 import sys
-import os
-import tempfile
-import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import numpy as np
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-# ─── Configuration ──────────────────────────────────────────────────────────
-NOISEMAP_BIN = Path(__file__).parent / "build" / "NoiseMap"
-PLY_INPUT    = Path(__file__).parent / "Data" / "ville.ply"
-OUTPUT_DIR   = Path(__file__).parent / "Data" / "generated"
-SCALE        = 100
-DRONES       = ["M2", "I2", "F-4", "S-9"]
-N_POSITIONS  = 250  # × 4 drones = 1000 files
-MIN_CLEARANCE = 0.05  # mesh units above building tops (5m at scale 100)
-# Drone altitude range in mesh units (at scale 100: 0.1 = 10m, 1.5 = 150m)
-Z_MIN = 0.1
-Z_MAX = 1.5
-# XY margin from mesh edges
-XY_MARGIN = 1.0
-SEED = 42
-N_WORKERS = os.cpu_count() or 4
+import numpy as np
 
-# ─── Parse PLY to get vertex positions ──────────────────────────────────────
+# ── Configuration ────────────────────────────────────────────────────────────
+SCRIPT_DIR   = Path(__file__).resolve().parent
+BUILD_DIR    = SCRIPT_DIR / "build"
+DATA_DIR     = SCRIPT_DIR / "Data"
+PLY_INPUTS   = [DATA_DIR / f for f in
+                ["ville.ply", "ville2.ply", "ville3.ply", "ville4.ply", "ville5.ply"]]
+NOISEMAP_BIN = BUILD_DIR / "NoiseMap"
 
-def parse_ply_vertices(ply_path):
-    """Read vertex positions from an ASCII PLY file."""
-    vertices = []
-    n_vertices = 0
-    with open(ply_path, 'r') as f:
-        # Parse header
+RESULTS_DIR = SCRIPT_DIR / "generated"
+TMP_DIR     = SCRIPT_DIR / "generated" / "_tmp"
+
+DRONES         = ["M2", "I2", "F-4", "S-9"]
+TOTAL_POINTS   = 2000              # 2000 fichiers au total
+POINTS_PER_DRONE = TOTAL_POINTS // len(DRONES)  # 500 par drone
+# Répartition uniforme sur les cartes : chaque drone a le même nombre de points
+# par carte → 500/5 = 100 pts/drone/carte, 400 pts/carte au total.
+POINTS_PER_DRONE_PER_MAP = POINTS_PER_DRONE // len(PLY_INPUTS)
+
+# Altitude du drone au-dessus du toit (en unités maillage, 1 unité = 100 m par
+# défaut). On reste bas pour des valeurs SPL intéressantes.
+Z_OFFSET_MIN = 0.2
+Z_OFFSET_MAX = 1.0
+
+# Marge d'inset depuis les bords de la bbox (fraction de la taille).
+EDGE_MARGIN_FRAC = 0.02
+
+# Taille de la grille 2D pour la hauteur max des bâtiments.
+GRID_RES = 256
+
+N_WORKERS = min(os.cpu_count() or 4, 16)
+
+RNG_SEED = 42
+
+
+# ── Lecture du PLY (ASCII) ───────────────────────────────────────────────────
+def read_ply_vertices(path: Path) -> np.ndarray:
+    """Retourne un tableau (N,3) des coordonnées x,y,z des sommets."""
+    with path.open("r") as f:
+        n_vertex = 0
         while True:
-            line = f.readline().strip()
-            if line.startswith('element vertex'):
-                n_vertices = int(line.split()[-1])
-            if line == 'end_header':
+            line = f.readline()
+            if not line:
+                raise RuntimeError("PLY header incomplet")
+            line = line.strip()
+            if line.startswith("element vertex"):
+                n_vertex = int(line.split()[-1])
+            if line == "end_header":
                 break
+        verts = np.empty((n_vertex, 3), dtype=np.float32)
+        for i in range(n_vertex):
+            parts = f.readline().split()
+            verts[i, 0] = float(parts[0])
+            verts[i, 1] = float(parts[1])
+            verts[i, 2] = float(parts[2])
+    return verts
 
-        # Read vertices
-        for _ in range(n_vertices):
-            parts = f.readline().strip().split()
-            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-            vertices.append((x, y, z))
 
-    return np.array(vertices)
+# ── Échantillonnage de points au-dessus des bâtiments ───────────────────────
+def build_height_map(verts: np.ndarray, res: int):
+    """Retourne (height_grid, x_min, y_min, dx, dy) : max Z par cellule (x,y)."""
+    x_min, y_min = verts[:, 0].min(), verts[:, 1].min()
+    x_max, y_max = verts[:, 0].max(), verts[:, 1].max()
+    dx = (x_max - x_min) / res
+    dy = (y_max - y_min) / res
+
+    ix = np.clip(((verts[:, 0] - x_min) / dx).astype(np.int32), 0, res - 1)
+    iy = np.clip(((verts[:, 1] - y_min) / dy).astype(np.int32), 0, res - 1)
+
+    height = np.full((res, res), -np.inf, dtype=np.float32)
+    # np.maximum.at fait l'accumulation max sans boucle Python.
+    np.maximum.at(height, (ix, iy), verts[:, 2])
+    # Cellules vides → 0 (sol).
+    height[~np.isfinite(height)] = 0.0
+    return height, float(x_min), float(y_min), float(dx), float(dy), float(x_max), float(y_max)
 
 
-# ─── Build 2D heightmap ────────────────────────────────────────────────────
+def _sample_in_cell(n, x0, x1, y0, y1, height, gx_min, gy_min, gdx, gdy,
+                    gres, z_max_map, rng):
+    """Échantillonne n points (x,y) uniformément dans la cellule rect donnée
+    et calcule z = toit_local + offset."""
+    xs = rng.uniform(x0, x1, n)
+    ys = rng.uniform(y0, y1, n)
+    ix = np.clip(((xs - gx_min) / gdx).astype(np.int32), 0, gres - 1)
+    iy = np.clip(((ys - gy_min) / gdy).astype(np.int32), 0, gres - 1)
+    hs = height[ix, iy]
+    offs = rng.uniform(Z_OFFSET_MIN, Z_OFFSET_MAX, n)
+    zs = np.minimum(hs + offs, z_max_map - 1e-3)
+    return xs, ys, zs, hs
 
-def build_heightmap(vertices, resolution=0.5):
+
+def sample_points_stratified(n_per_drone: int, n_drones: int,
+                             verts: np.ndarray,
+                             rng: np.random.Generator):
+    """Retourne (pts (N,3), drone_idx (N,)) avec N = n_per_drone*n_drones.
+
+    Stratification : la bbox est découpée en grille S×S ; chaque drone reçoit
+    le même nombre de points dans chaque cellule.  Cela garantit que chaque
+    drone couvre uniformément toute la carte (pas de biais N/S/E/O).
     """
-    Build a 2D grid of max Z values (building height) from mesh vertices.
-    Returns: heightmap (2D array), x_edges, y_edges
-    """
-    x_min, x_max = vertices[:, 0].min(), vertices[:, 0].max()
-    y_min, y_max = vertices[:, 1].min(), vertices[:, 1].max()
+    height, x_min, y_min, dx, dy, x_max, y_max = build_height_map(verts, GRID_RES)
+    z_max_map = float(verts[:, 2].max())
+    span_x = x_max - x_min
+    span_y = y_max - y_min
+    inset_x = EDGE_MARGIN_FRAC * span_x
+    inset_y = EDGE_MARGIN_FRAC * span_y
+    x_lo, x_hi = x_min + inset_x, x_max - inset_x
+    y_lo, y_hi = y_min + inset_y, y_max - inset_y
 
-    x_edges = np.arange(x_min, x_max + resolution, resolution)
-    y_edges = np.arange(y_min, y_max + resolution, resolution)
+    # Grille de stratification S×S : ~n_per_drone/S² points par drone par case.
+    # On prend S tel que n_per_drone soit divisible par S² → répartition exacte.
+    S = 5  # 25 cellules → 250/25 = 10 pts/drone/cellule, 40 pts/cellule total.
+    if n_per_drone % (S * S) != 0:
+        # fallback souple : on tolère un reste qu'on distribue aléatoirement.
+        pass
+    per_cell = n_per_drone // (S * S)
+    rem = n_per_drone - per_cell * S * S
 
-    heightmap = np.zeros((len(x_edges) - 1, len(y_edges) - 1))
+    cell_w = (x_hi - x_lo) / S
+    cell_h = (y_hi - y_lo) / S
 
-    # Bin vertices into grid cells and track max Z
-    x_idx = np.digitize(vertices[:, 0], x_edges) - 1
-    y_idx = np.digitize(vertices[:, 1], y_edges) - 1
-
-    # Clamp to valid range
-    x_idx = np.clip(x_idx, 0, len(x_edges) - 2)
-    y_idx = np.clip(y_idx, 0, len(y_edges) - 2)
-
-    for i in range(len(vertices)):
-        xi, yi = x_idx[i], y_idx[i]
-        heightmap[xi, yi] = max(heightmap[xi, yi], vertices[i, 2])
-
-    return heightmap, x_edges, y_edges
-
-
-def get_building_height_at(x, y, heightmap, x_edges, y_edges):
-    """Get the max building height at a given XY position."""
-    xi = np.searchsorted(x_edges, x) - 1
-    yi = np.searchsorted(y_edges, y) - 1
-    xi = np.clip(xi, 0, heightmap.shape[0] - 1)
-    yi = np.clip(yi, 0, heightmap.shape[1] - 1)
-    return heightmap[xi, yi]
-
-
-# ─── Generate valid source positions ───────────────────────────────────────
-
-def generate_positions(n, heightmap, x_edges, y_edges, rng):
-    """Generate n random source positions above buildings."""
-    x_min = x_edges[0] + XY_MARGIN
-    x_max = x_edges[-1] - XY_MARGIN
-    y_min = y_edges[0] + XY_MARGIN
-    y_max = y_edges[-1] - XY_MARGIN
-
-    positions = []
-    attempts = 0
-    max_attempts = n * 20
-
-    while len(positions) < n and attempts < max_attempts:
-        attempts += 1
-        x = rng.uniform(x_min, x_max)
-        y = rng.uniform(y_min, y_max)
-
-        # Get building height at this XY
-        bh = get_building_height_at(x, y, heightmap, x_edges, y_edges)
-
-        # Source Z must be above buildings with clearance
-        z_floor = max(Z_MIN, bh + MIN_CLEARANCE)
-
-        if z_floor > Z_MAX:
-            # This position is over a very tall building, skip
-            continue
-
-        z = rng.uniform(z_floor, Z_MAX)
-        positions.append((round(x, 4), round(y, 4), round(z, 4)))
-
-    return positions
+    total = n_per_drone * n_drones
+    pts = np.empty((total, 3), dtype=np.float64)
+    drone_idx = np.empty(total, dtype=np.int32)
+    k = 0
+    for d in range(n_drones):
+        # Points du drone d : per_cell par cellule + rem dispatchés.
+        extra_cells = rng.choice(S * S, size=rem, replace=False) if rem else []
+        extra_set = set(int(c) for c in extra_cells)
+        for ci in range(S):
+            for cj in range(S):
+                n_here = per_cell + (1 if (ci * S + cj) in extra_set else 0)
+                if n_here == 0:
+                    continue
+                x0 = x_lo + ci * cell_w
+                x1 = x0 + cell_w
+                y0 = y_lo + cj * cell_h
+                y1 = y0 + cell_h
+                # rejection : on garde ceux strictement au-dessus du toit local.
+                got = 0
+                while got < n_here:
+                    batch = max(n_here - got, 16)
+                    xs, ys, zs, hs = _sample_in_cell(
+                        batch, x0, x1, y0, y1,
+                        height, x_min, y_min, dx, dy, GRID_RES,
+                        z_max_map, rng)
+                    ok = zs > hs + 1e-3
+                    take = min(n_here - got, int(ok.sum()))
+                    sel = np.where(ok)[0][:take]
+                    pts[k:k + take, 0] = xs[sel]
+                    pts[k:k + take, 1] = ys[sel]
+                    pts[k:k + take, 2] = zs[sel]
+                    drone_idx[k:k + take] = d
+                    k += take
+                    got += take
+    assert k == total
+    return pts, drone_idx
 
 
-# ─── Single job (called by each worker thread) ────────────────────────────
-
-def run_one(job):
-    """Run NoiseMap for one (position, drone) combination.
-    Each worker uses its own temp symlink so outputs don't collide.
-    Returns (out_name, True/False, error_msg).
-    """
-    idx, x, y, z, drone, total = job
-    out_name = f"Ville_colored_{x}_{y}_{z}_{SCALE}_{drone}.ply"
-    out_path = OUTPUT_DIR / out_name
-
-    if out_path.exists():
-        return (out_name, idx, total, "skip", "")
-
-    # Create a unique temp symlink so NoiseMap writes to a unique output file
-    tmp_dir = tempfile.mkdtemp(prefix="noisemap_")
-    tmp_input = Path(tmp_dir) / "input.ply"
-    tmp_input.symlink_to(PLY_INPUT.resolve())
-    tmp_output = Path(tmp_dir) / "input_noisemap.ply"
+# ── Exécution d'un point ─────────────────────────────────────────────────────
+def run_one(args):
+    idx, drone, x, y, z, tmp_ply, results_drone_dir, map_name = args
+    # Chaque worker a son propre PLY d'entrée → sortie unique.
+    out_src = tmp_ply.with_name(tmp_ply.stem + "_noisemap.ply")
+    out_dst = Path(results_drone_dir) / (
+        f"NoiseMap_{map_name}_{x:.4f}_{y:.4f}_{z:.4f}_{drone}.ply"
+    )
 
     cmd = [
         str(NOISEMAP_BIN),
-        str(tmp_input),
-        str(x), str(y), str(z),
+        str(tmp_ply),
+        f"{x:.6f}", f"{y:.6f}", f"{z:.6f}",
         "--drone", drone,
-        "--scale", str(SCALE),
     ]
+    t0 = time.time()
+    proc = subprocess.run(cmd, cwd=str(BUILD_DIR),
+                          capture_output=True, text=True)
+    dt = time.time() - t0
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+    ok = proc.returncode == 0 and out_src.exists()
+    spl_min = spl_max = spl_mean = float("nan")
+    if ok:
+        shutil.move(str(out_src), str(out_dst))
+        # Parse stats depuis stderr (spdlog écrit sur stderr par défaut).
+        for line in (proc.stderr + proc.stdout).splitlines():
+            if "Min" in line and "dB(A)" in line:
+                try: spl_min = float(line.split(":")[-1].split("dB")[0])
+                except: pass
+            elif "Max" in line and "dB(A)" in line:
+                try: spl_max = float(line.split(":")[-1].split("dB")[0])
+                except: pass
+            elif "Mean" in line and "dB(A)" in line:
+                try: spl_mean = float(line.split(":")[-1].split("dB")[0])
+                except: pass
 
-        if result.returncode != 0:
-            return (out_name, idx, total, "fail", result.stderr.strip()[-200:])
-
-        if tmp_output.exists():
-            shutil.move(str(tmp_output), str(out_path))
-            return (out_name, idx, total, "ok", "")
-        else:
-            return (out_name, idx, total, "fail", "no output file produced")
-
-    except subprocess.TimeoutExpired:
-        return (out_name, idx, total, "timeout", "")
-    except Exception as e:
-        return (out_name, idx, total, "error", str(e))
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return {
+        "idx": idx, "drone": drone, "map": map_name,
+        "x": x, "y": y, "z": z,
+        "ok": ok, "dt": dt,
+        "spl_min": spl_min, "spl_max": spl_max, "spl_mean": spl_mean,
+        "stderr_tail": "" if ok else proc.stderr[-400:],
+    }
 
 
-# ─── Main ──────────────────────────────────────────────────────────────────
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print(f"Parsing {PLY_INPUT}...")
-    vertices = parse_ply_vertices(PLY_INPUT)
-    print(f"  {len(vertices)} vertices loaded")
-    print(f"  X: [{vertices[:,0].min():.2f}, {vertices[:,0].max():.2f}]")
-    print(f"  Y: [{vertices[:,1].min():.2f}, {vertices[:,1].max():.2f}]")
-    print(f"  Z: [{vertices[:,2].min():.2f}, {vertices[:,2].max():.2f}]")
+    if not NOISEMAP_BIN.exists():
+        sys.exit(f"Binaire introuvable : {NOISEMAP_BIN}")
+    for ply in PLY_INPUTS:
+        if not ply.exists():
+            sys.exit(f"PLY introuvable : {ply}")
 
-    print("Building heightmap...")
-    heightmap, x_edges, y_edges = build_heightmap(vertices)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    for d in DRONES:
+        (RESULTS_DIR / d).mkdir(exist_ok=True)
 
-    rng = np.random.default_rng(SEED)
+    rng = np.random.default_rng(RNG_SEED)
+    all_tasks = []  # (idx_global, drone, x, y, z, map_name, ply_path)
 
-    print(f"Generating {N_POSITIONS} source positions...")
-    positions = generate_positions(N_POSITIONS, heightmap, x_edges, y_edges, rng)
-    print(f"  {len(positions)} valid positions generated")
+    # ── Étape 1-2 : lecture + échantillonnage stratifié sur chaque carte ──
+    n_maps = len(PLY_INPUTS)
+    for ply_path in PLY_INPUTS:
+        map_name = ply_path.stem  # "ville", "ville2", …
+        print(f"[1/4] Lecture de {ply_path.name}…", flush=True)
+        verts = read_ply_vertices(ply_path)
+        print(f"      {len(verts)} sommets, bbox "
+              f"x=[{verts[:,0].min():.2f},{verts[:,0].max():.2f}] "
+              f"y=[{verts[:,1].min():.2f},{verts[:,1].max():.2f}] "
+              f"z=[{verts[:,2].min():.2f},{verts[:,2].max():.2f}]", flush=True)
 
-    # Create output directory
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"[2/4] Échantillonnage stratifié sur {map_name} : "
+              f"{POINTS_PER_DRONE_PER_MAP} pts/drone × {len(DRONES)} drones "
+              f"= {POINTS_PER_DRONE_PER_MAP * len(DRONES)} pts…", flush=True)
+        pts, drone_idx = sample_points_stratified(
+            POINTS_PER_DRONE_PER_MAP, len(DRONES), verts, rng)
+        for i in range(len(pts)):
+            all_tasks.append((
+                DRONES[drone_idx[i]],
+                float(pts[i, 0]), float(pts[i, 1]), float(pts[i, 2]),
+                map_name, ply_path,
+            ))
 
-    # Build list of all jobs
-    jobs = []
-    idx = 0
-    for i, (x, y, z) in enumerate(positions):
-        for drone in DRONES:
-            idx += 1
-            jobs.append((idx, x, y, z, drone, len(positions) * len(DRONES)))
-    total = len(jobs)
+    # Mélange global de l'ordre d'exécution (la stratification reste intacte
+    # puisqu'elle est déjà encodée dans les couples (pt, drone, map)).
+    rng.shuffle(all_tasks)
 
-    print(f"\nWill generate {total} files ({len(positions)} positions × {len(DRONES)} drones)")
-    print(f"Using {N_WORKERS} parallel workers")
-    print(f"Output directory: {OUTPUT_DIR}\n")
+    # ── Étape 3 : copies temporaires du PLY, une par (worker, carte) ──────
+    # Le binaire écrit <input>_noisemap.ply → chaque worker doit avoir son
+    # propre fichier d'entrée, et les cartes différentes doivent être
+    # séparées pour ne pas écraser le contenu.
+    print(f"[3/4] Préparation de {N_WORKERS}×{n_maps} copies PLY worker…",
+          flush=True)
+    tmp_plys = {}  # (worker_id, map_name) → Path
+    for w in range(N_WORKERS):
+        for ply_path in PLY_INPUTS:
+            map_name = ply_path.stem
+            p = TMP_DIR / f"worker_{w}_{map_name}.ply"
+            if not p.exists():
+                shutil.copy2(ply_path, p)
+            tmp_plys[(w, map_name)] = p
 
-    success = 0
-    failed = 0
+    # Construction de la liste de tâches finale avec assignation des workers.
+    tasks = []
+    for i, (drone, x, y, z, map_name, _ply_path) in enumerate(all_tasks):
+        w = i % N_WORKERS
+        tmp_ply = tmp_plys[(w, map_name)]
+        tasks.append((i, drone, x, y, z,
+                      tmp_ply, RESULTS_DIR / drone, map_name))
 
-    with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
-        futures = {pool.submit(run_one, job): job for job in jobs}
+    print(f"[4/4] Exécution de {len(tasks)} runs sur {N_WORKERS} workers…",
+          flush=True)
+    csv_path = RESULTS_DIR / "dataset.csv"
+    t0 = time.time()
+    n_ok = n_ko = 0
+    with csv_path.open("w", newline="") as fcsv, \
+         ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
+        writer = csv.writer(fcsv)
+        writer.writerow(["idx", "drone", "map", "x", "y", "z",
+                         "ok", "dt_s", "spl_min", "spl_max", "spl_mean"])
+        # On lance en batch par groupe de N_WORKERS pour éviter la
+        # concurrence sur le même fichier d'entrée.
+        for start in range(0, len(tasks), N_WORKERS):
+            chunk = tasks[start:start + N_WORKERS]
+            futures = [pool.submit(run_one, t) for t in chunk]
+            for fut in as_completed(futures):
+                r = fut.result()
+                writer.writerow([r["idx"], r["drone"], r["map"],
+                                 f"{r['x']:.6f}", f"{r['y']:.6f}", f"{r['z']:.6f}",
+                                 int(r["ok"]), f"{r['dt']:.3f}",
+                                 r["spl_min"], r["spl_max"], r["spl_mean"]])
+                if r["ok"]:
+                    n_ok += 1
+                else:
+                    n_ko += 1
+                    print(f"  [FAIL idx={r['idx']}] {r['stderr_tail']}",
+                          file=sys.stderr)
+            done = start + len(chunk)
+            elapsed = time.time() - t0
+            eta = elapsed / done * (len(tasks) - done) if done else 0
+            print(f"  {done}/{len(tasks)}  "
+                  f"ok={n_ok} ko={n_ko}  "
+                  f"elapsed={elapsed:.1f}s  eta={eta:.1f}s", flush=True)
 
-        for future in as_completed(futures):
-            out_name, idx, total, status, err = future.result()
-
-            if status == "skip":
-                success += 1
-            elif status == "ok":
-                success += 1
-                if success % 50 == 0 or (success + failed) == total:
-                    print(f"  [{success + failed}/{total}] OK: {out_name}")
-            elif status == "timeout":
-                print(f"  [{success + failed}/{total}] TIMEOUT: {out_name}")
-                failed += 1
-            else:
-                print(f"  [{success + failed}/{total}] FAIL: {out_name}")
-                if err:
-                    print(f"    {err}")
-                failed += 1
-
-    print(f"\nDone! {success} succeeded, {failed} failed out of {total}")
-    print(f"Files in: {OUTPUT_DIR}")
+    print(f"Terminé : {n_ok} OK / {n_ko} KO en {time.time()-t0:.1f}s")
+    print(f"CSV : {csv_path}")
+    print(f"PLYs : {RESULTS_DIR}/<drone>/")
 
 
 if __name__ == "__main__":
