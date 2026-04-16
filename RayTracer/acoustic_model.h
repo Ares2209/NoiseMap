@@ -106,7 +106,7 @@ struct ManoeuvreParams {
 struct AcousticParams {
     // -- Échelle & référentiel --
     double unit_scale      = 100.0;  ///< 1 unité mesh = unit_scale mètres (défaut 100)
-    int    reflection_order = 1;     ///< Ordre de réflexion : 0 = direct seul, 1 = +réflexion sol
+    int    reflection_order = 1;     ///< Ordre de réflexion : 0 = direct seul, 1 = +un trajet réfléchi séparé
 
     // -- Source --
     double source_height   = -1.0;   ///< Hauteur source [m] (-1 = auto depuis Z × scale)

@@ -26,6 +26,7 @@
 
 using Kernel      = CGAL::Simple_cartesian<double>;
 using Point       = Kernel::Point_3;
+using Vector      = Kernel::Vector_3;
 using SurfaceMesh = CGAL::Surface_mesh<Point>;
 
 // ─── Colour helpers ───────────────────────────────────────────────────────────
@@ -62,7 +63,8 @@ public:
     // ── Acoustic computation ─────────────────────────────────────────────────
 
     /// Compute A-weighted SPL [dB(A)] for every face given ray distances.
-    /// Includes ground reflection for occluded faces (image source method).
+    /// Adds a first-order specular reflection when a valid
+    /// source -> visible reflector centroid -> receiver centroid path exists.
     /// @param distances  Per-face distance from direct ray tracing
     /// @param model      Acoustic propagation model
     /// @param source     3D position of the sound source
@@ -95,6 +97,9 @@ public:
     /// Face centroids (computed once, cached).
     const std::vector<Point>& faceCentroids() const;
 
+    /// Face normals (computed once, cached).
+    const std::vector<Vector>& faceNormals() const;
+
     /// Returns true if the point lies within the mesh bounding box (with margin).
     /// Sets bbox_min / bbox_max to the mesh bounds.
     bool isInsideBBox(const Point& p, double margin,
@@ -112,10 +117,15 @@ private:
     /// Build face-centroid cache.
     void _buildCentroids() const;
 
+    /// Build face-normal cache.
+    void _buildNormals() const;
+
     // ── Data members ─────────────────────────────────────────────────────────
 
     SurfaceMesh                   mesh_;
     std::unique_ptr<RayTracer>    rayTracer_;
     mutable std::vector<Point>    centroids_;   ///< cached face centroids
+    mutable std::vector<Vector>   normals_;     ///< cached face normals
     mutable bool                  centroidsDirty_ = true;
+    mutable bool                  normalsDirty_   = true;
 };

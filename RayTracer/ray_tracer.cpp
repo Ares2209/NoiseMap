@@ -88,12 +88,21 @@ RayTracer::RayTracer(SurfaceMesh& mesh) : mesh(mesh)
             static_cast<float>(p.z())));
     }
 
-    for (auto f : mesh.faces())
-        for (auto v : CGAL::vertices_around_face(mesh.halfedge(f), mesh))
-            h_indices.push_back(vmap.at(v));
+    for (auto f : mesh.faces()) {
+        unsigned int n = 0;
+        for (auto v : CGAL::vertices_around_face(mesh.halfedge(f), mesh)) {
+            if (n < 3)
+                h_indices.push_back(vmap.at(v));
+            ++n;
+        }
+        if (n != 3) {
+            spdlog::error("RayTracer: face {} has {} vertices (expected 3 after triangulation)", f.idx(), n);
+        }
+    }
 
     // Précalcul des centroïdes de chaque face (une seule fois)
     h_centroids.reserve(num_faces);
+    unsigned int non_tri_faces = 0;
     for (auto f : mesh.faces()) {
         Point pts[3];
         unsigned int n = 0;
@@ -109,7 +118,9 @@ RayTracer::RayTracer(SurfaceMesh& mesh) : mesh(mesh)
                 static_cast<float>(c.y()),
                 static_cast<float>(c.z())));
         } else {
-            // Face dégénérée : NaN pour que le kernel la détecte
+            // OptiX ici ne traite correctement que les triangles.
+            // Les faces non triangulaires sont marquées invalides.
+            ++non_tri_faces;
             h_centroids.push_back(make_float3(
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN(),
@@ -133,6 +144,11 @@ RayTracer::RayTracer(SurfaceMesh& mesh) : mesh(mesh)
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_centroids), centroidBytes));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(d_centroids),
                           h_centroids.data(), centroidBytes, cudaMemcpyHostToDevice));
+
+    if (non_tri_faces > 0) {
+        spdlog::warn("RayTracer: {} non-triangular faces will be ignored by centroid tracing",
+                     non_tri_faces);
+    }
 
     // Buffers persistants pour le lancement (réutilisés à chaque appel)
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_hits_buf),

@@ -13,6 +13,7 @@
 #include <CGAL/Polygon_mesh_processing/repair.h>
 #include <CGAL/Polygon_mesh_processing/stitch_borders.h>
 #include <CGAL/Polygon_mesh_processing/compute_normal.h>
+#include <CGAL/Polygon_mesh_processing/triangulate_faces.h>
 
 #include <fstream>
 #include <stdexcept>
@@ -22,6 +23,45 @@
 #include <numeric>
 
 namespace PMP = CGAL::Polygon_mesh_processing;
+
+namespace {
+
+double vectorNorm(const Vector& v)
+{
+    return std::sqrt(v.squared_length());
+}
+
+Vector normalizedOrZero(const Vector& v)
+{
+    const double norm = vectorNorm(v);
+    if (norm <= 1e-12)
+        return Vector(0.0, 0.0, 0.0);
+    return v / norm;
+}
+
+double dotProduct(const Vector& a, const Vector& b)
+{
+    return a.x() * b.x() + a.y() * b.y() + a.z() * b.z();
+}
+
+Vector reflectAroundNormal(const Vector& incident_to_surface,
+                           const Vector& unit_normal)
+{
+    return incident_to_surface
+         - 2.0 * dotProduct(incident_to_surface, unit_normal) * unit_normal;
+}
+
+double energySumDb(double a_db, double b_db)
+{
+    if (!std::isfinite(a_db)) return b_db;
+    if (!std::isfinite(b_db)) return a_db;
+
+    const double e_a = std::pow(10.0, a_db / 10.0);
+    const double e_b = std::pow(10.0, b_db / 10.0);
+    return 10.0 * std::log10(e_a + e_b);
+}
+
+}  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Colormap par seuils absolus de bruit [dB(A)]
@@ -119,9 +159,11 @@ void Scene::_repairMesh()
     PMP::remove_isolated_vertices(mesh_);
     PMP::stitch_borders(mesh_);
     PMP::remove_degenerate_faces(mesh_);
+    PMP::triangulate_faces(mesh_);
     mesh_.collect_garbage();
 
     centroidsDirty_ = true;
+    normalsDirty_   = true;
 
     spdlog::debug("_repairMesh done: {} V / {} F",
                   mesh_.number_of_vertices(),
@@ -164,6 +206,27 @@ const std::vector<Point>& Scene::faceCentroids() const
     return centroids_;
 }
 
+void Scene::_buildNormals() const
+{
+    normals_.clear();
+    normals_.reserve(mesh_.number_of_faces());
+
+    for (auto f : mesh_.faces()) {
+        Vector n = PMP::compute_face_normal(f, mesh_);
+        normals_.push_back(normalizedOrZero(n));
+    }
+
+    normalsDirty_ = false;
+    spdlog::debug("_buildNormals: {} normals", normals_.size());
+}
+
+const std::vector<Vector>& Scene::faceNormals() const
+{
+    if (normalsDirty_)
+        _buildNormals();
+    return normals_;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Ray tracing
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +267,8 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
                                            const Point&              source) const
 {
     const size_t N = distances.size();
+    const float visibility_threshold =
+        std::numeric_limits<float>::max() * 0.5f;
     std::vector<double> spl(N, -std::numeric_limits<double>::infinity());
 
     const auto& ap     = model.params();
@@ -211,6 +276,132 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
 
     const double hs_m = source.z() * scale;
     const auto& cents = faceCentroids();
+    const auto& norms = faceNormals();
+
+    struct ReflectionCandidate {
+        bool   valid = false;
+        size_t reflector_idx = 0;
+        double total_distance_m = 0.0;
+        double spl_db = -std::numeric_limits<double>::infinity();
+        double alignment_cos = -1.0;
+    };
+
+    std::vector<ReflectionCandidate> best_reflection(N);
+
+    size_t reflector_count = 0;
+    size_t tested_pairs = 0;
+    size_t valid_pairs = 0;
+    size_t rejected_invalid_normal = 0;
+    size_t rejected_reflector_not_visible = 0;
+    size_t rejected_target_not_visible = 0;
+    size_t rejected_zero_reflected_dir = 0;
+    size_t rejected_zero_outgoing_dir = 0;
+    size_t rejected_alignment = 0;
+
+    if (ap.reflection_order >= 1) {
+        const double eps_mesh = std::max(1e-6, 0.01 / std::max(scale, 1e-9));
+        const double min_alignment_cos = std::cos(15.0 * M_PI / 180.0);
+
+        for (size_t j = 0; j < N && j < cents.size() && j < norms.size(); ++j) {
+            const float d_source_to_reflector_raw = distances[j];
+            if (d_source_to_reflector_raw <= 0.0f
+                || d_source_to_reflector_raw >= visibility_threshold) {
+                ++rejected_reflector_not_visible;
+                continue;
+            }
+
+            const Point& reflector = cents[j];
+            Vector normal = normalizedOrZero(norms[j]);
+            if (vectorNorm(normal) <= 1e-12) {
+                ++rejected_invalid_normal;
+                continue;
+            }
+
+            ++reflector_count;
+
+            Vector to_source = source - reflector;
+            if (dotProduct(normal, to_source) < 0.0)
+                normal = -normal;
+
+            const Point offset_origin = reflector + eps_mesh * normal;
+            const auto reflected_distances = rayTracer_->traceRay(offset_origin);
+
+            const double d_source_to_reflector_m =
+                std::max(static_cast<double>(d_source_to_reflector_raw) * scale,
+                         1e-3);
+
+            const Vector incident_dir = normalizedOrZero(reflector - source);
+            const Vector reflected_dir_expected =
+                normalizedOrZero(reflectAroundNormal(incident_dir, normal));
+
+            if (vectorNorm(reflected_dir_expected) <= 1e-12) {
+                ++rejected_zero_reflected_dir;
+                continue;
+            }
+
+            for (size_t i = 0; i < N && i < cents.size(); ++i) {
+                if (i == j || i >= reflected_distances.size())
+                    continue;
+
+                const float d_reflector_to_target_raw = reflected_distances[i];
+                if (d_reflector_to_target_raw <= 0.0f
+                    || d_reflector_to_target_raw >= visibility_threshold) {
+                    ++rejected_target_not_visible;
+                    continue;
+                }
+
+                ++tested_pairs;
+
+                const Point& target = cents[i];
+                const Vector outgoing_dir = normalizedOrZero(target - reflector);
+                if (vectorNorm(outgoing_dir) <= 1e-12) {
+                    ++rejected_zero_outgoing_dir;
+                    continue;
+                }
+
+                const double alignment_cos =
+                    dotProduct(reflected_dir_expected, outgoing_dir);
+                if (alignment_cos < min_alignment_cos) {
+                    ++rejected_alignment;
+                    continue;
+                }
+
+                const double dx_rt = (target.x() - reflector.x()) * scale;
+                const double dy_rt = (target.y() - reflector.y()) * scale;
+                const double dz_rt = (target.z() - reflector.z()) * scale;
+                const double d_reflector_to_target_m =
+                    std::max(std::sqrt(dx_rt * dx_rt + dy_rt * dy_rt + dz_rt * dz_rt),
+                             1e-3);
+
+                const double hr_target_m = target.z() * scale;
+                AcousticParams ap_face = ap;
+                ap_face.source_height = hs_m;
+                ap_face.receiver_height = hr_target_m;
+                AcousticModel model_face(ap_face);
+
+                const double total_distance_m =
+                    d_source_to_reflector_m + d_reflector_to_target_m;
+                const double candidate_spl =
+                    model_face.computeSPL(total_distance_m,
+                                          /*visible=*/true,
+                                          /*direct_only=*/true);
+
+                if (!std::isfinite(candidate_spl))
+                    continue;
+
+                ++valid_pairs;
+
+                ReflectionCandidate& best = best_reflection[i];
+                if (!best.valid || candidate_spl > best.spl_db) {
+                    best.valid = true;
+                    best.reflector_idx = j;
+                    best.total_distance_m = total_distance_m;
+                    best.spl_db = candidate_spl;
+                    best.alignment_cos = alignment_cos;
+                }
+            }
+        }
+    }
 
     double spl_max = -std::numeric_limits<double>::infinity();
     double spl_min =  std::numeric_limits<double>::infinity();
@@ -219,7 +410,8 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
 
     for (size_t i = 0; i < N; ++i) {
         const float d_raw        = distances[i];
-        const bool direct_visible = (d_raw > 0.0f);
+        const bool direct_visible =
+            (d_raw > 0.0f && d_raw < visibility_threshold);
 
         if (i >= cents.size()) continue;
         const Point& c = cents[i];
@@ -238,37 +430,19 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
         ap_face.receiver_height = hr_m;
         AcousticModel model_face(ap_face);
 
-        // ── Rayon réfléchi ───────────────────────────────────────────────
-        double spl_reflected = -std::numeric_limits<double>::infinity();
-
-        if (ap.reflection_order >= 1 && hr_m >= 0.0 && hs_m >= 0.0) {
-            spl_reflected = model_face.computeReflectedSPL(
-                                d_horiz_m, hs_m, hr_m);
-        }
+        double spl_direct = -std::numeric_limits<double>::infinity();
+        double spl_reflected = best_reflection[i].valid
+            ? best_reflection[i].spl_db
+            : -std::numeric_limits<double>::infinity();
 
         if (direct_visible) {
-            // Distance 3D réelle source → centroïde (ou du ray tracer)
-            // Utilise d_raw du ray tracer car c'est la vraie distance
-            // de propagation (le rayon peut longer un obstacle)
             const double d_direct_m = std::max(
                 static_cast<double>(d_raw) * scale, 1e-3);
 
-            // direct_only=true : groundEffect désactivé,
-            // réflexion traitée séparément ci-dessus
-            double spl_direct = model_face.computeSPL(
-                                    d_direct_m, /*visible=*/true,
-                                    /*direct_only=*/true);
-
-            // Combinaison énergétique
-            if (std::isfinite(spl_reflected)) {
-                double e_d = std::pow(10.0, spl_direct    / 10.0);
-                double e_r = std::pow(10.0, spl_reflected / 10.0);
-                spl[i] = 10.0 * std::log10(e_d + e_r);
-            } else {
-                spl[i] = spl_direct;
-            }
+            spl_direct = model_face.computeSPL(
+                d_direct_m, /*visible=*/true, /*direct_only=*/true);
+            spl[i] = energySumDb(spl_direct, spl_reflected);
             ++vis_direct;
-
         } else if (std::isfinite(spl_reflected)) {
             spl[i] = spl_reflected;
             ++vis_reflected;
@@ -280,11 +454,24 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
         }
     }
 
-    spdlog::info("computeNoiseMap: {}/{} direct, {}/{} reflected-only  "
-                 "SPL min={:.1f}  max={:.1f} dB(A)",
+    spdlog::info("computeNoiseMap: {}/{} direct, {}/{} reflected-only, "
+                 "{} reflectors tested, {} candidate paths, {} valid specular "
+                 "paths, SPL min={:.1f} max={:.1f} dB(A)",
                  vis_direct, N, vis_reflected, N,
+                 reflector_count, tested_pairs, valid_pairs,
                  std::isfinite(spl_min) ? spl_min : 0.0,
                  std::isfinite(spl_max) ? spl_max : 0.0);
+    spdlog::debug("reflection debug: rejected reflectors not visible={}, "
+                  "invalid normals={}, rejected target not visible={}, "
+                  "zero reflected dir={}, zero outgoing dir={}, "
+                  "alignment rejects={} (threshold={:.2f} deg)",
+                  rejected_reflector_not_visible,
+                  rejected_invalid_normal,
+                  rejected_target_not_visible,
+                  rejected_zero_reflected_dir,
+                  rejected_zero_outgoing_dir,
+                  rejected_alignment,
+                  15.0);
 
     return spl;
 }
@@ -407,19 +594,11 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
         }
     }
 
-    // Onde directe uniquement : les faces occultées ne reçoivent aucun son.
-    // Réinitialise les sommets de toute face occultée en gris foncé pour éviter
-    // que l'interpolation des couleurs par sommet ne colore ces faces.
-    {
-        size_t i = 0;
-        for (auto f : mesh_.faces()) {
-            if (i >= spl.size() || !std::isfinite(spl[i])) {
-                for (auto v : CGAL::vertices_around_face(mesh_.halfedge(f), mesh_))
-                    vcolor[v] = CGAL::IO::Color(30, 30, 30);
-            }
-            ++i;
-        }
-    }
+    // Les sommets qui ne bordent AUCUNE face avec un SPL fini restent
+    // au gris par défaut (vCount == 0 → pas touché par la boucle ci-dessus).
+    // On ne réinitialise PAS les sommets partagés entre faces visibles et
+    // occultées : cela écrasait la couleur des faces visibles en bordure
+    // d'ombre et créait des « trous » angulaires dans la noise map.
 
     spdlog::debug("addNoiseMapColor: face colour {} / vertex colour {}",
                   fc_created ? "added" : "updated",

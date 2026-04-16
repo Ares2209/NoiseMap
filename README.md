@@ -238,8 +238,8 @@ make ScaleFinder
 
 J'aimerais que ce code prenne en compte la reflexion de cette manière : 
 
-Le modèle considère deux rayons distincts pour chaque événement de vol : un rayon direct et un rayon réfléchi par le sol. Ces deux rayons sont traités en parallèle via des processus séparés, puis combinés en sortie.
+Le modèle considère deux rayons distincts pour chaque centroïde récepteur : un rayon direct et, lorsqu'il existe, un rayon réfléchi spéculairement sur une face du maillage. Ces deux rayons sont traités séparément, puis combinés en sortie.
 
-Pour chaque rayon, une trajectoire tridimensionnelle est calculée à la fréquence d'échantillonnage audio, donnant la position de la source à chaque instant. Pour le rayon direct, la hauteur du récepteur est simplement soustraite à la composante verticale. Pour le rayon réfléchi, la trajectoire est miroir par rapport au sol, simulant une source image située sous le plan du sol.
+Le rayon réfléchi n'est retenu que s'il existe un chemin du type source -> centroïde d'incidence visible -> centroïde récepteur, et si la loi de Snell-Descartes pour la réflexion spéculaire est satisfaite au centroïde d'incidence : la direction réfléchie est le symétrique de la direction incidente par rapport à la normale de la face. Le centroïde récepteur peut être visible depuis la source, mais ce n'est pas obligatoire : il peut recevoir uniquement la réflexion.
 
 Cela est simplement pour le traitement de chaque rayon, on laisse par la suite les différents filtrage déjà implémentés
