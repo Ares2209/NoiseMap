@@ -24,3 +24,5 @@ env/
 dist/
 *.egg
 *.whl
+
+generated/

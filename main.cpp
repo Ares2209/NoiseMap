@@ -19,6 +19,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <chrono>
 #include <string>
 #include <iostream>
 #include <stdexcept>
@@ -416,20 +417,24 @@ int main(int argc, char* argv[])
             }
         }
 
-        // ── 2. Ray tracing ────────────────────────────────────────────────
+        // ── 2. Génération de la noise map (ray tracing + acoustique) ────
+        auto t_noisemap = std::chrono::high_resolution_clock::now();
+
         std::vector<float> distances = scene.traceRays(emission);
         scene.addDistances(distances);
 
-        // ── 3. Modèle acoustique (direct + réflexion au sol) ────────────
         AcousticModel       model(acousticParams);
         std::vector<double> spl_dBA = scene.computeNoiseMap(distances, model,
                                                              emission);
         scene.addSPL(spl_dBA);
-
-        // ── 4. Colorisation ───────────────────────────────────────────────
         scene.addNoiseMapColor(spl_dBA);
 
-        // ── 5. Export PLY ─────────────────────────────────────────────────
+        auto t_noisemap_end = std::chrono::high_resolution_clock::now();
+        auto noisemap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t_noisemap_end - t_noisemap).count();
+        spdlog::info("Noise map generated in {:.1f} s", noisemap_ms / 1000.0);
+
+        // ── 3. Export PLY ─────────────────────────────────────────────────
         const std::string outPath =
             plyFilePath.substr(0, plyFilePath.find_last_of('.'))
             + "_noisemap.ply";

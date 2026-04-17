@@ -350,11 +350,6 @@ std::vector<float> RayTracer::computeRaysAndHits(const Point& origin) const
         }
     }
 
-    spdlog::debug("{} rays: {} visible, {} occluded",
-        num_faces,
-        std::count(h_hits.begin(), h_hits.end(), 0u),
-        std::count(h_hits.begin(), h_hits.end(), 1u));
-
     return result;
 }
 
@@ -362,30 +357,17 @@ std::vector<float> RayTracer::computeRaysAndHits(const Point& origin) const
 
 std::vector<float> RayTracer::traceRay(const Point& p) const
 {
-    auto start = high_resolution_clock::now();
-
-    auto distances = computeRaysAndHits(p);
-
-    auto ms = duration_cast<milliseconds>(high_resolution_clock::now() - start).count();
-    spdlog::debug("{} rays computed in {} ms", distances.size(), ms);
-    return distances;
+    return computeRaysAndHits(p);
 }
 
 // ─── traceRay (multiple points) ──────────────────────────────────────────────
 
 std::vector<std::vector<float>> RayTracer::traceRay(const std::vector<Point>& points) const
 {
-    auto start = high_resolution_clock::now();
-    spdlog::debug("traceRay batch: {} points", points.size());
-
     std::vector<std::vector<float>> result;
     result.reserve(points.size());
     for (const auto& p : points)
         result.push_back(computeRaysAndHits(p));
-
-    auto ms = duration_cast<milliseconds>(high_resolution_clock::now() - start).count();
-    spdlog::debug("{} points x {} faces in {} ms",
-                  points.size(), num_faces, ms);
     return result;
 }
 

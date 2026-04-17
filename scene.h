@@ -128,4 +128,7 @@ private:
     mutable std::vector<Vector>   normals_;     ///< cached face normals
     mutable bool                  centroidsDirty_ = true;
     mutable bool                  normalsDirty_   = true;
+    mutable Point                 bboxMin_;
+    mutable Point                 bboxMax_;
+    mutable bool                  bboxDirty_ = true;
 };

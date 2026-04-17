@@ -18,6 +18,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -51,13 +52,16 @@ Vector reflectAroundNormal(const Vector& incident_to_surface,
          - 2.0 * dotProduct(incident_to_surface, unit_normal) * unit_normal;
 }
 
+// ln(10)/10 — used to replace pow(10, x/10) with the faster exp(x * LN10_OVER_10)
+constexpr double LN10_OVER_10 = 0.23025850929940457;
+
 double energySumDb(double a_db, double b_db)
 {
     if (!std::isfinite(a_db)) return b_db;
     if (!std::isfinite(b_db)) return a_db;
 
-    const double e_a = std::pow(10.0, a_db / 10.0);
-    const double e_b = std::pow(10.0, b_db / 10.0);
+    const double e_a = std::exp(a_db * LN10_OVER_10);
+    const double e_b = std::exp(b_db * LN10_OVER_10);
     return 10.0 * std::log10(e_a + e_b);
 }
 
@@ -180,19 +184,15 @@ void Scene::_buildCentroids() const
     centroids_.reserve(mesh_.number_of_faces());
 
     for (auto f : mesh_.faces()) {
-        std::vector<Point> pts;
-        pts.reserve(3);
-        for (auto v : CGAL::vertices_around_face(mesh_.halfedge(f), mesh_))
-            pts.push_back(mesh_.point(v));
-
-        if (pts.size() == 3) {
-            centroids_.push_back(CGAL::centroid(pts[0], pts[1], pts[2]));
-        } else if (!pts.empty()) {
-            double cx = 0, cy = 0, cz = 0;
-            for (auto& p : pts) { cx += p.x(); cy += p.y(); cz += p.z(); }
-            double n = static_cast<double>(pts.size());
-            centroids_.emplace_back(cx / n, cy / n, cz / n);
-        }
+        // All faces are triangles after _repairMesh() — use halfedge traversal
+        // to avoid allocating a std::vector per face.
+        auto h = mesh_.halfedge(f);
+        const Point& p0 = mesh_.point(mesh_.target(h));
+        h = mesh_.next(h);
+        const Point& p1 = mesh_.point(mesh_.target(h));
+        h = mesh_.next(h);
+        const Point& p2 = mesh_.point(mesh_.target(h));
+        centroids_.push_back(CGAL::centroid(p0, p1, p2));
     }
 
     centroidsDirty_ = false;
@@ -233,27 +233,12 @@ const std::vector<Vector>& Scene::faceNormals() const
 
 std::vector<float> Scene::traceRays(const Point& source) const
 {
-    spdlog::debug("traceRays: source=({:.3f},{:.3f},{:.3f})",
-                  source.x(), source.y(), source.z());
-
     std::vector<float> distances = rayTracer_->traceRay(source);
 
     if (distances.size() != mesh_.number_of_faces()) {
         spdlog::warn("traceRays: distance count ({}) != face count ({})",
                      distances.size(), mesh_.number_of_faces());
     }
-
-    // ── Debug : compte les faces visibles ────────────────────────────────────
-    const float occluded_threshold = std::numeric_limits<float>::max() * 0.5f;
-    size_t visible = std::count_if(distances.begin(), distances.end(),
-        [&](float d){ return d > 0.0f && d < occluded_threshold; });
-
-    spdlog::debug("traceRays: {}/{} faces visible (threshold={:.2e})",
-                  visible, distances.size(), occluded_threshold);
-
-    // ── Dump des 10 premières distances pour vérification ────────────────────
-    for (size_t i = 0; i < std::min<size_t>(10, distances.size()); ++i)
-        spdlog::trace("  dist[{}] = {:.4f}", i, distances[i]);
 
     return distances;
 }
@@ -266,6 +251,8 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
                                            const AcousticModel&      model,
                                            const Point&              source) const
 {
+    const auto t_start = std::chrono::high_resolution_clock::now();
+
     const size_t N = distances.size();
     const float visibility_threshold =
         std::numeric_limits<float>::max() * 0.5f;
@@ -277,6 +264,61 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
     const double hs_m = source.z() * scale;
     const auto& cents = faceCentroids();
     const auto& norms = faceNormals();
+
+    // ── Pre-compute spectral constants (invariant across all faces) ──────
+    double rpm_eff = 0.0;
+    if (ap.drone_model) {
+        rpm_eff = ap.rpm_actual;
+        if (rpm_eff <= 0.0) {
+            ManoeuvreParams mp = AcousticModel::getManoeuvreParams(
+                ap.manoeuvre, *ap.drone_model);
+            rpm_eff = mp.rpm_average;
+        }
+    }
+
+    double Lw_pre[NUM_BANDS];
+    if (ap.drone_model) {
+        AcousticModel::computeDroneLw(*ap.drone_model, rpm_eff, Lw_pre, ap.d_ref);
+    } else {
+        for (int b = 0; b < NUM_BANDS; ++b)
+            Lw_pre[b] = ap.source_Lw[b];
+    }
+
+    // Absorption coefficients [dB/m] — depend only on atmosphere, constant
+    double abs_coeff[NUM_BANDS];
+    {
+        AcousticModel base_model(ap);
+        for (int b = 0; b < NUM_BANDS; ++b)
+            abs_coeff[b] = base_model.absorptionCoefficient(THIRD_OCTAVE_FREQS[b]);
+    }
+
+    // Pre-compute Lw + A-weighting combined (avoids addition in hot loop)
+    double Lw_Aw[NUM_BANDS];
+    for (int b = 0; b < NUM_BANDS; ++b)
+        Lw_Aw[b] = Lw_pre[b] + A_WEIGHTING[b];
+
+    const double neg_inf = -std::numeric_limits<double>::infinity();
+
+    // Fast inline SPL computation (direct_only mode: no ground effect).
+    // Replaces per-face AcousticModel construction + computeSPL call.
+    auto fastSPL = [&](double distance_m, double receiver_height_m) -> double {
+        if (distance_m <= 0.0) return neg_inf;
+        const double dz = hs_m - receiver_height_m;
+        const double d_horiz = std::sqrt(std::max(0.0,
+            distance_m * distance_m - dz * dz));
+        const double theta = AcousticModel::elevationAngle(d_horiz, dz);
+        const double A_div = AcousticModel::geometricalSpreading(distance_m);
+
+        double sum = 0.0;
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            const double D = AcousticModel::directivityCorrection(
+                theta, THIRD_OCTAVE_FREQS[b]);
+            const double Lp_Aw = Lw_Aw[b] - A_div
+                - abs_coeff[b] * distance_m + D;
+            sum += std::exp(Lp_Aw * LN10_OVER_10);
+        }
+        return 10.0 * std::log10(std::max(sum, 1e-30));
+    };
 
     struct ReflectionCandidate {
         bool   valid = false;
@@ -311,8 +353,10 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
             }
 
             const Point& reflector = cents[j];
-            Vector normal = normalizedOrZero(norms[j]);
-            if (vectorNorm(normal) <= 1e-12) {
+            // Normals are already unit-length from _buildNormals();
+            // skip only if the stored normal was a zero vector (degenerate face).
+            Vector normal = norms[j];
+            if (normal.squared_length() < 0.5) {
                 ++rejected_invalid_normal;
                 continue;
             }
@@ -334,7 +378,7 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
             const Vector reflected_dir_expected =
                 normalizedOrZero(reflectAroundNormal(incident_dir, normal));
 
-            if (vectorNorm(reflected_dir_expected) <= 1e-12) {
+            if (reflected_dir_expected.squared_length() < 1e-24) {
                 ++rejected_zero_reflected_dir;
                 continue;
             }
@@ -354,7 +398,7 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
 
                 const Point& target = cents[i];
                 const Vector outgoing_dir = normalizedOrZero(target - reflector);
-                if (vectorNorm(outgoing_dir) <= 1e-12) {
+                if (outgoing_dir.squared_length() < 1e-24) {
                     ++rejected_zero_outgoing_dir;
                     continue;
                 }
@@ -373,18 +417,11 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
                     std::max(std::sqrt(dx_rt * dx_rt + dy_rt * dy_rt + dz_rt * dz_rt),
                              1e-3);
 
-                const double hr_target_m = target.z() * scale;
-                AcousticParams ap_face = ap;
-                ap_face.source_height = hs_m;
-                ap_face.receiver_height = hr_target_m;
-                AcousticModel model_face(ap_face);
-
                 const double total_distance_m =
                     d_source_to_reflector_m + d_reflector_to_target_m;
+                const double hr_target_m = target.z() * scale;
                 const double candidate_spl =
-                    model_face.computeSPL(total_distance_m,
-                                          /*visible=*/true,
-                                          /*direct_only=*/true);
+                    fastSPL(total_distance_m, hr_target_m);
 
                 if (!std::isfinite(candidate_spl))
                     continue;
@@ -416,31 +453,18 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
         if (i >= cents.size()) continue;
         const Point& c = cents[i];
 
-        // ── Géométrie réelle face i ─────────────────────────────────────
-        double dx       = (c.x() - source.x()) * scale;
-        double dy       = (c.y() - source.y()) * scale;
-        double hr_m     = c.z() * scale;            // hauteur récepteur [m]
-        double dz_m     = hs_m - hr_m;              // diff. verticale [m]
-        double d_horiz_m = std::sqrt(dx*dx + dy*dy);
+        const double hr_m = c.z() * scale;
 
-        // ── Construit un modèle acoustique avec les hauteurs correctes ──
-        // On clone les params et on met à jour source_height / receiver_height
-        AcousticParams ap_face = ap;
-        ap_face.source_height   = hs_m;
-        ap_face.receiver_height = hr_m;
-        AcousticModel model_face(ap_face);
-
-        double spl_direct = -std::numeric_limits<double>::infinity();
+        double spl_direct = neg_inf;
         double spl_reflected = best_reflection[i].valid
             ? best_reflection[i].spl_db
-            : -std::numeric_limits<double>::infinity();
+            : neg_inf;
 
         if (direct_visible) {
             const double d_direct_m = std::max(
                 static_cast<double>(d_raw) * scale, 1e-3);
 
-            spl_direct = model_face.computeSPL(
-                d_direct_m, /*visible=*/true, /*direct_only=*/true);
+            spl_direct = fastSPL(d_direct_m, hr_m);
             spl[i] = energySumDb(spl_direct, spl_reflected);
             ++vis_direct;
         } else if (std::isfinite(spl_reflected)) {
@@ -454,24 +478,18 @@ std::vector<double> Scene::computeNoiseMap(const std::vector<float>& distances,
         }
     }
 
-    spdlog::info("computeNoiseMap: {}/{} direct, {}/{} reflected-only, "
-                 "{} reflectors tested, {} candidate paths, {} valid specular "
-                 "paths, SPL min={:.1f} max={:.1f} dB(A)",
-                 vis_direct, N, vis_reflected, N,
-                 reflector_count, tested_pairs, valid_pairs,
+    const auto t_end = std::chrono::high_resolution_clock::now();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_end - t_start).count();
+
+    spdlog::info("computeNoiseMap: {} faces, {}/{} direct, {}/{} reflected-only, "
+                 "{} reflectors, {} valid specular paths, "
+                 "SPL [{:.1f}, {:.1f}] dB(A) — {:.1f} s",
+                 N, vis_direct, N, vis_reflected, N,
+                 reflector_count, valid_pairs,
                  std::isfinite(spl_min) ? spl_min : 0.0,
-                 std::isfinite(spl_max) ? spl_max : 0.0);
-    spdlog::debug("reflection debug: rejected reflectors not visible={}, "
-                  "invalid normals={}, rejected target not visible={}, "
-                  "zero reflected dir={}, zero outgoing dir={}, "
-                  "alignment rejects={} (threshold={:.2f} deg)",
-                  rejected_reflector_not_visible,
-                  rejected_invalid_normal,
-                  rejected_target_not_visible,
-                  rejected_zero_reflected_dir,
-                  rejected_zero_outgoing_dir,
-                  rejected_alignment,
-                  15.0);
+                 std::isfinite(spl_max) ? spl_max : 0.0,
+                 elapsed_ms / 1000.0);
 
     return spl;
 }
@@ -574,7 +592,7 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
         size_t i = 0;
         for (auto f : mesh_.faces()) {
             if (i < spl.size() && std::isfinite(spl[i])) {
-                double energy = std::pow(10.0, spl[i] / 10.0);
+                double energy = std::exp(spl[i] * LN10_OVER_10);
                 for (auto v :
                      CGAL::vertices_around_face(mesh_.halfedge(f), mesh_)) {
                     vEnergy[v.idx()] += energy;
@@ -612,26 +630,32 @@ void Scene::addNoiseMapColor(const std::vector<double>& spl)
 bool Scene::isInsideBBox(const Point& p, double margin,
                          Point& bbox_min, Point& bbox_max) const
 {
-    double xmin =  std::numeric_limits<double>::infinity();
-    double ymin =  std::numeric_limits<double>::infinity();
-    double zmin =  std::numeric_limits<double>::infinity();
-    double xmax = -std::numeric_limits<double>::infinity();
-    double ymax = -std::numeric_limits<double>::infinity();
-    double zmax = -std::numeric_limits<double>::infinity();
+    if (bboxDirty_) {
+        double xmin =  std::numeric_limits<double>::infinity();
+        double ymin =  std::numeric_limits<double>::infinity();
+        double zmin =  std::numeric_limits<double>::infinity();
+        double xmax = -std::numeric_limits<double>::infinity();
+        double ymax = -std::numeric_limits<double>::infinity();
+        double zmax = -std::numeric_limits<double>::infinity();
 
-    for (auto v : mesh_.vertices()) {
-        const Point& pt = mesh_.point(v);
-        xmin = std::min(xmin, pt.x()); xmax = std::max(xmax, pt.x());
-        ymin = std::min(ymin, pt.y()); ymax = std::max(ymax, pt.y());
-        zmin = std::min(zmin, pt.z()); zmax = std::max(zmax, pt.z());
+        for (auto v : mesh_.vertices()) {
+            const Point& pt = mesh_.point(v);
+            xmin = std::min(xmin, pt.x()); xmax = std::max(xmax, pt.x());
+            ymin = std::min(ymin, pt.y()); ymax = std::max(ymax, pt.y());
+            zmin = std::min(zmin, pt.z()); zmax = std::max(zmax, pt.z());
+        }
+
+        bboxMin_ = Point(xmin, ymin, zmin);
+        bboxMax_ = Point(xmax, ymax, zmax);
+        bboxDirty_ = false;
     }
 
-    bbox_min = Point(xmin, ymin, zmin);
-    bbox_max = Point(xmax, ymax, zmax);
+    bbox_min = bboxMin_;
+    bbox_max = bboxMax_;
 
-    return p.x() >= xmin - margin && p.x() <= xmax + margin
-        && p.y() >= ymin - margin && p.y() <= ymax + margin
-        && p.z() >= zmin - margin && p.z() <= zmax + margin;
+    return p.x() >= bboxMin_.x() - margin && p.x() <= bboxMax_.x() + margin
+        && p.y() >= bboxMin_.y() - margin && p.y() <= bboxMax_.y() + margin
+        && p.z() >= bboxMin_.z() - margin && p.z() <= bboxMax_.z() + margin;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
